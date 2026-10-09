@@ -11,6 +11,8 @@ from app.core.init_db import init_db, seed_demo_data
 from app.modules.inventory.router import router as inventory_router
 from app.modules.billing.router import router as billing_router
 from app.modules.ledger.router import router as ledger_router
+from app.modules.reports.router import router as reports_router
+from app.modules.ai_assistant.router import router as ai_router
 
 
 @asynccontextmanager
@@ -34,9 +36,11 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
+    allow_origin_regex=settings.CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
@@ -63,6 +67,8 @@ async def health_check():
 app.include_router(inventory_router, prefix=settings.API_V1_STR)
 app.include_router(billing_router, prefix=settings.API_V1_STR)
 app.include_router(ledger_router, prefix=settings.API_V1_STR)
+app.include_router(reports_router, prefix=settings.API_V1_STR)
+app.include_router(ai_router, prefix=settings.API_V1_STR)
 
 
 if __name__ == "__main__":

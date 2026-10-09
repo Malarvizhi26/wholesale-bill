@@ -1,10 +1,10 @@
 import React from 'react';
-import { ShoppingCart, LayoutDashboard, Package, Users, FileText, Wifi, WifiOff, Globe } from 'lucide-react';
+import { ShoppingCart, LayoutDashboard, Package, Users, FileText, Wifi, WifiOff, Globe, Sparkles } from 'lucide-react';
 import type { Language } from '../types';
 
 interface NavbarProps {
-  activeTab: 'pos' | 'dashboard' | 'inventory' | 'ledger' | 'reports';
-  setActiveTab: (tab: 'pos' | 'dashboard' | 'inventory' | 'ledger' | 'reports') => void;
+  activeTab: 'pos' | 'dashboard' | 'inventory' | 'ledger' | 'reports' | 'assistant';
+  setActiveTab: (tab: 'pos' | 'dashboard' | 'inventory' | 'ledger' | 'reports' | 'assistant') => void;
   language: Language;
   setLanguage: (lang: Language) => void;
   isBackendConnected: boolean;
@@ -103,6 +103,18 @@ export const Navbar: React.FC<NavbarProps> = ({
             >
               <FileText className="w-4 h-4" />
               <span>{language === 'ta' ? 'அறிக்கைகள்' : 'Reports'}</span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('assistant')}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                activeTab === 'assistant'
+                  ? 'bg-gradient-to-r from-emerald-600 to-teal-500 text-white shadow-md ring-1 ring-emerald-400'
+                  : 'text-emerald-300 hover:text-white hover:bg-slate-700/50'
+              }`}
+            >
+              <Sparkles className="w-4 h-4 text-emerald-400" />
+              <span>{language === 'ta' ? 'AI உதவியாளர்' : 'AI Assistant'}</span>
             </button>
           </nav>
 

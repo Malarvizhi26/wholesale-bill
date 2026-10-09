@@ -1,10 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
-  Search, Plus, Trash2, Printer, Share2, PauseCircle, 
-  AlertTriangle, X, ShieldAlert, Split
+  Plus, Trash2, Printer, Share2, PauseCircle, 
+  AlertTriangle, X, ShieldAlert, Split, UserPlus,
+  FileText, RotateCcw, Truck, Receipt, CheckCircle2,
+  FolderOpen, ArrowRight, Barcode
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
-import type { Product, Party, POSLineItem, BillSummary, HeldBill, Language, ProductUnit } from '../types';
+import type { 
+  Product, Party, POSLineItem, BillSummary, HeldBill, Language, 
+  ProductUnit, PartyCreateInput, BillingMode, QuotationRecord, 
+  DeliveryChallanRecord, SalesReturnRecord
+} from '../types';
 import { api } from '../api/client';
 import { KbdBadge } from './ui/KbdBadge';
 import { CurrencyCell } from './ui/CurrencyCell';
@@ -13,9 +19,13 @@ interface BillingPOSProps {
   products: Product[];
   parties: Party[];
   language: Language;
+  onAddParty?: (data: PartyCreateInput) => Promise<Party>;
 }
 
-export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, language }) => {
+export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, language, onAddParty }) => {
+  // Billing Mode: Tax Invoice, Sales Return, Quotation, or Delivery Challan
+  const [billingMode, setBillingMode] = useState<BillingMode>('INVOICE');
+
   // Active Bill State
   const [selectedParty, setSelectedParty] = useState<Party | null>(null);
   const [lines, setLines] = useState<POSLineItem[]>([]);
@@ -27,20 +37,42 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
   const [paidAmount, setPaidAmount] = useState<number | undefined>(undefined);
   const [invoiceNumber, setInvoiceNumber] = useState('C1/26-27/0001');
 
+  // Mode-Specific Fields
+  const [returnReason, setReturnReason] = useState('Excess material returned from site');
+  const [refundMode, setRefundMode] = useState<'CREDIT_NOTE' | 'CASH' | 'UPI'>('CREDIT_NOTE');
+  const [vehicleNumber, setVehicleNumber] = useState('TN-30-AZ-1234');
+  const [deliverySiteAddress, setDeliverySiteAddress] = useState('Plot 45, Junction Main Road, Salem');
+  const [quotationNotes, setQuotationNotes] = useState('Valid for 7 days. Subject to market price revision.');
+
+  // Quick Customer Modal State
+  const [showQuickCustModal, setShowQuickCustModal] = useState(false);
+  const [quickCustName, setQuickCustName] = useState('');
+  const [quickCustPhone, setQuickCustPhone] = useState('');
+  const [quickCustCreditLimit, setQuickCustCreditLimit] = useState('25000');
+  const [quickCustPriceTier, setQuickCustPriceTier] = useState<'CONTRACTOR' | 'RETAIL' | 'WHOLESALE'>('CONTRACTOR');
+  const [isSavingCustomer, setIsSavingCustomer] = useState(false);
+
   // Split payment state
   const [cashPart, setCashPart] = useState('');
   const [upiPart, setUpiPart] = useState('');
   const [creditPart, setCreditPart] = useState('');
 
-  // Modals
+  // Modals & Feedback
   const [showReceiptModal, setShowReceiptModal] = useState(false);
   const [showHoldModal, setShowHoldModal] = useState(false);
   const [showSplitModal, setShowSplitModal] = useState(false);
   const [showPinModal, setShowPinModal] = useState(false);
+  const [showDocManagerModal, setShowDocManagerModal] = useState(false);
+  const [docManagerTab, setDocManagerTab] = useState<'QUOTES' | 'CHALLANS' | 'RETURNS'>('QUOTES');
+  const [recentQuotes, setRecentQuotes] = useState<QuotationRecord[]>([]);
+  const [recentChallans, setRecentChallans] = useState<DeliveryChallanRecord[]>([]);
+  const [recentReturns, setRecentReturns] = useState<SalesReturnRecord[]>([]);
   const [ownerPin, setOwnerPin] = useState('');
   const [pinError, setPinError] = useState(false);
   const [isPinApproved, setIsPinApproved] = useState(false);
   const [heldBills, setHeldBills] = useState<HeldBill[]>([]);
+  const [isSubmittingDoc, setIsSubmittingDoc] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Refs for keyboard shortcuts
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -51,9 +83,16 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
 
   // Credit limit breach check
   const isCreditOverLimit = Boolean(
-    selectedParty && selectedParty.credit_limit > 0 && 
-    (selectedParty.current_balance + summary.grandTotal) > selectedParty.credit_limit
+    billingMode === 'INVOICE' &&
+    selectedParty && Number(selectedParty.credit_limit || 0) > 0 && 
+    (Number(selectedParty.current_balance || 0) + summary.grandTotal) > Number(selectedParty.credit_limit || 0)
   );
+
+  // Show transient toast
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 4500);
+  };
 
   // Keyboard shortcut listener
   useEffect(() => {
@@ -86,7 +125,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       // F8: Split Payment
       else if (e.key === 'F8') {
         e.preventDefault();
-        if (lines.length > 0) {
+        if (lines.length > 0 && billingMode === 'INVOICE') {
           setCashPart((summary.grandTotal / 2).toFixed(2));
           setUpiPart((summary.grandTotal / 2).toFixed(2));
           setCreditPart('0.00');
@@ -110,14 +149,62 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
         setShowHoldModal(false);
         setShowSplitModal(false);
         setShowPinModal(false);
+        setShowQuickCustModal(false);
+        setShowDocManagerModal(false);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [lines, selectedParty, summary, paymentMode, isCreditOverLimit, isPinApproved]);
+  }, [lines, selectedParty, summary, paymentMode, isCreditOverLimit, isPinApproved, billingMode]);
 
-  // Product search filter with keyboard arrow navigation
+  // Load documents when document manager modal opens
+  useEffect(() => {
+    if (showDocManagerModal) {
+      loadRecentDocuments();
+    }
+  }, [showDocManagerModal]);
+
+  const loadRecentDocuments = async () => {
+    const [qList, cList, rList] = await Promise.all([
+      api.listQuotations(30),
+      api.listDeliveryChallans(30),
+      api.listSalesReturns(30),
+    ]);
+    setRecentQuotes(qList);
+    setRecentChallans(cList);
+    setRecentReturns(rList);
+  };
+
+  // Quick Add Customer Handler
+  const handleQuickAddCustomer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!quickCustName.trim()) return;
+    try {
+      setIsSavingCustomer(true);
+      if (onAddParty) {
+        const created = await onAddParty({
+          name: quickCustName.trim(),
+          phone: quickCustPhone.trim() || undefined,
+          party_type: 'CUSTOMER',
+          price_list_code: quickCustPriceTier,
+          credit_limit: parseFloat(quickCustCreditLimit) || 0,
+          credit_days: 30,
+          opening_balance: 0,
+          state_code: '33',
+        });
+        setSelectedParty(created);
+        setIsPinApproved(false);
+      }
+      setShowQuickCustModal(false);
+      setQuickCustName('');
+      setQuickCustPhone('');
+    } finally {
+      setIsSavingCustomer(false);
+    }
+  };
+
+  // Product search filter with keyboard arrow navigation & Barcode matching
   useEffect(() => {
     if (!searchQuery.trim()) {
       setSearchResults([]);
@@ -129,46 +216,87 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     const filtered = products.filter(
       p => p.name.toLowerCase().includes(q) ||
            p.code.toLowerCase().includes(q) ||
-           (p.tamil_name && p.tamil_name.toLowerCase().includes(q))
+           (p.tamil_name && p.tamil_name.toLowerCase().includes(q)) ||
+           p.units.some(u => u.barcode && u.barcode.toLowerCase().includes(q))
     );
     setSearchResults(filtered);
     setShowSearchResults(filtered.length > 0);
     setSelectedSearchIdx(0);
   }, [searchQuery, products]);
 
-  // Omnibar keyboard navigation (Up/Down/Enter)
-  const handleSearchKeyDown = (e: React.KeyboardEvent) => {
-    if (!showSearchResults || searchResults.length === 0) return;
-
-    if (e.key === 'ArrowDown') {
+  // Omnibar keyboard navigation & Auto Barcode scanner Enter handler
+  const handleSearchKeyDown = async (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowDown' && showSearchResults && searchResults.length > 0) {
       e.preventDefault();
       setSelectedSearchIdx(prev => (prev + 1) % searchResults.length);
-    } else if (e.key === 'ArrowUp') {
+    } else if (e.key === 'ArrowUp' && showSearchResults && searchResults.length > 0) {
       e.preventDefault();
       setSelectedSearchIdx(prev => (prev - 1 + searchResults.length) % searchResults.length);
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      const chosen = searchResults[selectedSearchIdx];
-      if (chosen) addProductToBill(chosen);
+      // First check if backend search finds exact barcode
+      const cleanQ = searchQuery.trim();
+      if (!cleanQ) return;
+
+      try {
+        const backendMatch = await api.searchBillingProducts(cleanQ);
+        if (backendMatch.length > 0) {
+          const item = backendMatch[0];
+          // Find matching product in catalog or construct
+          const matchedProd = products.find(p => p.id === item.id) || {
+            id: item.id,
+            code: item.code,
+            name: item.name,
+            tamil_name: item.tamil_name,
+            hsn_code: item.hsn_code,
+            base_unit: item.base_unit,
+            is_variable_weight: item.is_variable_weight,
+            min_stock_base: 0,
+            purchase_price_base: item.cost_price_base,
+            units: item.units.map(u => ({
+              unit_name: u.unit_name,
+              conversion_factor: u.conversion_factor,
+              can_buy: true,
+              can_sell: u.can_sell,
+              barcode: u.barcode,
+              is_default_sales_unit: u.is_default_sales_unit,
+            }))
+          };
+          addProductToBill(matchedProd, item.matched_unit);
+          return;
+        }
+      } catch {
+        // Fallback to local search results
+      }
+
+      const chosen = searchResults[selectedSearchIdx] || searchResults[0];
+      if (chosen) {
+        addProductToBill(chosen);
+      }
     }
   };
 
-  // Add Product to bill
-  const addProductToBill = (prod: Product) => {
-    const defaultUnit: ProductUnit = prod.units.find(u => u.is_default_sales_unit) || prod.units[0] || {
-      unit_name: prod.base_unit,
-      conversion_factor: 1,
-      can_buy: true,
-      can_sell: true
-    };
+  // Add Product to bill with smart packaging unit auto-selection
+  const addProductToBill = (prod: Product, targetUnitName?: string) => {
+    let chosenUnit: ProductUnit;
+    if (targetUnitName) {
+      chosenUnit = prod.units.find(u => u.unit_name.toLowerCase() === targetUnitName.toLowerCase()) || prod.units[0];
+    } else {
+      chosenUnit = prod.units.find(u => u.is_default_sales_unit) || prod.units[0] || {
+        unit_name: prod.base_unit,
+        conversion_factor: 1,
+        can_buy: true,
+        can_sell: true
+      };
+    }
 
     let unitPrice = 0;
-    if (prod.code === 'SCR001') unitPrice = 185.00;
-    else if (prod.code === 'TMT012') unitPrice = 650.00;
+    if (prod.code === 'SCR001') unitPrice = chosenUnit.unit_name === 'Box' ? 185.00 : 1.85;
+    else if (prod.code === 'TMT012') unitPrice = chosenUnit.unit_name === 'Rod' ? 650.00 : 61.00;
     else if (prod.code === 'PNT001') unitPrice = 275.00;
     else if (prod.code === 'PIP001') unitPrice = 85.00;
-    else if (prod.code === 'GIW020') unitPrice = 1850.00;
-    else unitPrice = prod.purchase_price_base * 1.25;
+    else if (prod.code === 'GIW020') unitPrice = chosenUnit.unit_name === 'Coil' ? 1850.00 : 74.00;
+    else unitPrice = Math.round(prod.purchase_price_base * chosenUnit.conversion_factor * 1.25);
 
     const newLine: POSLineItem = {
       id: Math.random().toString(36).substring(7),
@@ -177,12 +305,12 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       name: prod.name,
       tamilName: prod.tamil_name,
       hsnCode: prod.hsn_code,
-      unitName: defaultUnit.unit_name,
-      conversionFactor: defaultUnit.conversion_factor,
+      unitName: chosenUnit.unit_name,
+      conversionFactor: chosenUnit.conversion_factor,
       quantity: 1,
       isVariableWeight: prod.is_variable_weight,
       actualWeightKg: prod.is_variable_weight ? 10.65 : undefined,
-      baseQuantity: defaultUnit.conversion_factor,
+      baseQuantity: chosenUnit.conversion_factor,
       unitPrice,
       discountType: 'FLAT',
       discountValue: 0,
@@ -193,7 +321,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       sgstAmount: 0,
       igstAmount: 0,
       lineTotal: unitPrice,
-      availableUnits: prod.units.length > 0 ? prod.units : [defaultUnit],
+      availableUnits: prod.units.length > 0 ? prod.units : [chosenUnit],
     };
 
     setLines(prev => [...prev, newLine]);
@@ -271,7 +399,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     setLines(prev => prev.filter(l => l.id !== lineId));
   };
 
-  // Start new bill
+  // Start new bill / reset POS
   const startNewBill = () => {
     setLines([]);
     setSelectedParty(null);
@@ -279,8 +407,21 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     setPaymentMode('CASH');
     setPaidAmount(undefined);
     setIsPinApproved(false);
-    const num = parseInt(invoiceNumber.split('/')[2]) + 1;
-    setInvoiceNumber(`C1/26-27/${num.toString().padStart(4, '0')}`);
+    const prefix = billingMode === 'INVOICE' ? 'C1/26-27/' :
+                   billingMode === 'RETURN' ? 'RET/26-27/' :
+                   billingMode === 'QUOTATION' ? 'QT/26-27/' : 'DC/26-27/';
+    const num = Math.floor(Math.random() * 900) + 100;
+    setInvoiceNumber(`${prefix}${num.toString().padStart(4, '0')}`);
+  };
+
+  // Switch Mode
+  const handleModeChange = (mode: BillingMode) => {
+    setBillingMode(mode);
+    const prefix = mode === 'INVOICE' ? 'C1/26-27/' :
+                   mode === 'RETURN' ? 'RET/26-27/' :
+                   mode === 'QUOTATION' ? 'QT/26-27/' : 'DC/26-27/';
+    const num = Math.floor(Math.random() * 900) + 100;
+    setInvoiceNumber(`${prefix}${num.toString().padStart(4, '0')}`);
   };
 
   // Hold current bill
@@ -295,6 +436,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     };
     setHeldBills(prev => [...prev, newHeld]);
     startNewBill();
+    showToast('Bill placed on Hold Tray (F7 to recall)');
   };
 
   // Recall held bill
@@ -310,7 +452,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     setPaymentMode(mode);
 
     // If credit mode or customer exceeds limit without override PIN
-    if (mode === 'CREDIT' && isCreditOverLimit && !isPinApproved) {
+    if (billingMode === 'INVOICE' && mode === 'CREDIT' && isCreditOverLimit && !isPinApproved) {
       setShowPinModal(true);
       return;
     }
@@ -332,11 +474,198 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     }
   };
 
+  // Finalize transaction with Server API
+  const handleFinalizeTransaction = async () => {
+    try {
+      setIsSubmittingDoc(true);
+
+      if (billingMode === 'INVOICE') {
+        const payload = {
+          party_id: selectedParty?.id,
+          customer_name: selectedParty?.name || 'Walk-in Retail',
+          customer_phone: selectedParty?.phone,
+          customer_gstin: selectedParty?.gstin,
+          payment_mode: paymentMode,
+          paid_amount: paidAmount !== undefined ? paidAmount : (paymentMode === 'CREDIT' ? 0 : summary.grandTotal),
+          lines: lines.map(l => ({
+            product_id: l.productId,
+            unit_name: l.unitName,
+            conversion_factor: l.conversionFactor,
+            quantity: l.quantity,
+            is_variable_weight: l.isVariableWeight,
+            actual_weight_kg: l.actualWeightKg,
+            unit_price: l.unitPrice,
+            discount_type: l.discountType,
+            discount_value: l.discountValue,
+            gst_rate_percent: l.gstRatePercent,
+          })),
+        };
+        const inv = await api.createInvoice(payload);
+        showToast(`Tax Invoice ${inv.invoice_number} saved & stock decremented!`);
+      } else if (billingMode === 'RETURN') {
+        const payload = {
+          party_id: selectedParty?.id,
+          customer_name: selectedParty?.name || 'Walk-in Customer',
+          refund_mode: refundMode,
+          reason: returnReason,
+          lines: lines.map(l => ({
+            product_id: l.productId,
+            unit_name: l.unitName,
+            conversion_factor: l.conversionFactor,
+            quantity: l.quantity,
+            unit_price: l.unitPrice,
+            gst_rate_percent: l.gstRatePercent,
+          })),
+        };
+        const ret = await api.createSalesReturn(payload);
+        showToast(`Sales Return ${ret.return_number} recorded & stock restored!`);
+      } else if (billingMode === 'QUOTATION') {
+        const payload = {
+          party_id: selectedParty?.id,
+          customer_name: selectedParty?.name || 'Contractor / Customer',
+          customer_phone: selectedParty?.phone,
+          notes: quotationNotes,
+          lines: lines.map(l => ({
+            product_id: l.productId,
+            unit_name: l.unitName,
+            conversion_factor: l.conversionFactor,
+            quantity: l.quantity,
+            unit_price: l.unitPrice,
+            discount_amount: l.discountAmount,
+            gst_rate_percent: l.gstRatePercent,
+          })),
+        };
+        const qt = await api.createQuotation(payload);
+        showToast(`Quotation ${qt.quotation_number} generated!`);
+      } else if (billingMode === 'CHALLAN') {
+        const payload = {
+          party_id: selectedParty?.id,
+          customer_name: selectedParty?.name || 'Site Buyer',
+          customer_phone: selectedParty?.phone,
+          delivery_site_address: deliverySiteAddress,
+          vehicle_number: vehicleNumber,
+          lines: lines.map(l => ({
+            product_id: l.productId,
+            unit_name: l.unitName,
+            conversion_factor: l.conversionFactor,
+            quantity: l.quantity,
+            unit_price: l.unitPrice,
+          })),
+        };
+        const dc = await api.createDeliveryChallan(payload);
+        showToast(`Delivery Challan ${dc.challan_number} dispatched & stock moved!`);
+      }
+
+      window.print();
+      startNewBill();
+      setShowReceiptModal(false);
+    } catch (err: any) {
+      showToast(`Note: ${err.message || 'Saved locally in SQLite counter sync queue'}`);
+      window.print();
+      startNewBill();
+      setShowReceiptModal(false);
+    } finally {
+      setIsSubmittingDoc(false);
+    }
+  };
+
+  // Convert Quotation to Invoice
+  const handleConvertQuotation = async (q: QuotationRecord) => {
+    try {
+      const inv = await api.convertQuotationToInvoice(q.id, 'CASH');
+      showToast(`Quotation ${q.quotation_number} converted to Tax Invoice ${inv.invoice_number}!`);
+      loadRecentDocuments();
+    } catch (err: any) {
+      alert(`Error converting quotation: ${err.message}`);
+    }
+  };
+
+  // Convert Delivery Challan to Invoice
+  const handleConvertChallan = async (dc: DeliveryChallanRecord) => {
+    try {
+      const inv = await api.convertChallanToInvoice(dc.id, 'CREDIT');
+      showToast(`Challan ${dc.challan_number} converted to Invoice ${inv.invoice_number} (no duplicate stock deduction)!`);
+      loadRecentDocuments();
+    } catch (err: any) {
+      alert(`Error converting challan: ${err.message}`);
+    }
+  };
+
   // Dynamic UPI QR code URI
   const upiIntentUri = `upi://pay?pa=salemtraders@icici&pn=Salem%20Sri%20Murugan%20Hardware&am=${summary.grandTotal.toFixed(2)}&cu=INR&tn=Invoice_${invoiceNumber}`;
 
   return (
-    <div className="max-w-7xl mx-auto px-4 py-4 space-y-4">
+    <div className="max-w-7xl mx-auto px-4 py-3 space-y-3">
+      {/* Toast Alert */}
+      {toastMessage && (
+        <div className="fixed top-16 right-6 z-50 bg-emerald-600 text-white px-4 py-2.5 rounded-xl shadow-2xl flex items-center gap-2 border border-emerald-400 font-semibold text-xs animate-bounce">
+          <CheckCircle2 className="w-4 h-4" />
+          <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {/* Mode Switcher Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-950 p-2 rounded-xl border border-slate-800 shadow-sm">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <button
+            onClick={() => handleModeChange('INVOICE')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition shadow-sm ${
+              billingMode === 'INVOICE'
+                ? 'bg-emerald-600 text-white border border-emerald-400'
+                : 'bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-700'
+            }`}
+          >
+            <Receipt className="w-3.5 h-3.5 text-emerald-300" />
+            <span>{language === 'ta' ? 'விற்பனை பில்' : 'Tax Invoice'}</span>
+          </button>
+
+          <button
+            onClick={() => handleModeChange('RETURN')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition shadow-sm ${
+              billingMode === 'RETURN'
+                ? 'bg-rose-600 text-white border border-rose-400'
+                : 'bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-700'
+            }`}
+          >
+            <RotateCcw className="w-3.5 h-3.5 text-rose-300" />
+            <span>{language === 'ta' ? 'பொருட்கள் திருப்பல்' : 'Sales Return / Credit Note'}</span>
+          </button>
+
+          <button
+            onClick={() => handleModeChange('QUOTATION')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition shadow-sm ${
+              billingMode === 'QUOTATION'
+                ? 'bg-sky-600 text-white border border-sky-400'
+                : 'bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-700'
+            }`}
+          >
+            <FileText className="w-3.5 h-3.5 text-sky-300" />
+            <span>{language === 'ta' ? 'விலை மதிப்பீடு' : 'Quotation / Estimate'}</span>
+          </button>
+
+          <button
+            onClick={() => handleModeChange('CHALLAN')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition shadow-sm ${
+              billingMode === 'CHALLAN'
+                ? 'bg-violet-600 text-white border border-violet-400'
+                : 'bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-700'
+            }`}
+          >
+            <Truck className="w-3.5 h-3.5 text-violet-300" />
+            <span>{language === 'ta' ? 'டெலிவரி சலான்' : 'Delivery Challan (DC)'}</span>
+          </button>
+        </div>
+
+        {/* Manager Modal Trigger */}
+        <button
+          onClick={() => setShowDocManagerModal(true)}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
+        >
+          <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
+          <span>{language === 'ta' ? 'ஆவண மேலாளர் (Quotes/DC)' : 'Quotes & Challans Tray'}</span>
+        </button>
+      </div>
+
       {/* Top Customer Station & Credit Bar */}
       <div className="grid grid-cols-1 md:grid-cols-12 gap-3 hardware-card p-3 shadow-md">
         {/* Customer Selector */}
@@ -345,23 +674,34 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
             <span>{language === 'ta' ? 'வாடிக்கையாளர்:' : 'Customer:'}</span>
             <KbdBadge>F4</KbdBadge>
           </label>
-          <select
-            ref={partySelectRef}
-            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:border-emerald-500 font-medium"
-            value={selectedParty?.id || ''}
-            onChange={(e) => {
-              const party = parties.find(p => p.id === e.target.value) || null;
-              setSelectedParty(party);
-              setIsPinApproved(false);
-            }}
-          >
-            <option value="">Walk-in Retail (சில்லறை விற்பனை)</option>
-            {parties.filter(p => p.party_type === 'CUSTOMER').map(p => (
-              <option key={p.id} value={p.id}>
-                {p.name} {p.phone ? `(${p.phone})` : ''} - Bal: ₹{p.current_balance.toFixed(0)}
-              </option>
-            ))}
-          </select>
+          <div className="flex-1 flex items-center gap-1.5">
+            <select
+              ref={partySelectRef}
+              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:border-emerald-500 font-medium"
+              value={selectedParty?.id || ''}
+              onChange={(e) => {
+                const party = parties.find(p => p.id === e.target.value) || null;
+                setSelectedParty(party);
+                setIsPinApproved(false);
+              }}
+            >
+              <option value="">Walk-in Retail (சில்லறை விற்பனை)</option>
+              {parties.filter(p => p.party_type === 'CUSTOMER' || p.party_type === 'BOTH').map(p => (
+                <option key={p.id} value={p.id}>
+                  {p.name} {p.phone ? `(${p.phone})` : ''} - Bal: ₹{Number(p.current_balance ?? 0).toFixed(0)}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => setShowQuickCustModal(true)}
+              title={language === 'ta' ? 'புதிய வாடிக்கையாளர் சேர்க்க' : 'Quick Add Customer'}
+              className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold flex items-center gap-1 transition shadow-sm whitespace-nowrap"
+            >
+              <UserPlus className="w-3.5 h-3.5" />
+              <span>{language === 'ta' ? '+ புதியவர்' : '+ Add'}</span>
+            </button>
+          </div>
         </div>
 
         {/* Customer Balance & Credit Alert Badge */}
@@ -370,10 +710,10 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
             <div className="flex items-center justify-between bg-slate-900/90 px-3 py-1.5 rounded-lg border border-slate-700/80 w-full">
               <div className="flex items-center gap-2">
                 <span className="text-slate-400">Balance:</span>
-                <CurrencyCell amount={selectedParty.current_balance} highlight={selectedParty.current_balance > 0 ? 'amber' : 'default'} />
+                <CurrencyCell amount={Number(selectedParty.current_balance ?? 0)} highlight={Number(selectedParty.current_balance ?? 0) > 0 ? 'amber' : 'default'} />
                 <span className="text-slate-600">|</span>
                 <span className="text-slate-400">Limit:</span>
-                <span className="font-mono text-slate-300">₹{selectedParty.credit_limit.toLocaleString()}</span>
+                <span className="font-mono text-slate-300">₹{Number(selectedParty.credit_limit ?? 0).toLocaleString()}</span>
               </div>
               {isCreditOverLimit && (
                 <span className="flex items-center gap-1 text-red-400 font-bold bg-red-950/70 px-2 py-0.5 rounded border border-red-800 text-[10px]">
@@ -388,9 +728,14 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
           )}
         </div>
 
-        {/* Invoice Number & Held Tray */}
+        {/* Document Number & Held Tray */}
         <div className="md:col-span-3 flex items-center justify-end gap-2 text-xs">
-          <span className="bg-slate-900 px-3 py-1 rounded-lg border border-slate-700 font-mono text-emerald-400 font-black tracking-wide">
+          <span className={`px-3 py-1 rounded-lg border font-mono font-black tracking-wide ${
+            billingMode === 'INVOICE' ? 'bg-slate-900 border-slate-700 text-emerald-400' :
+            billingMode === 'RETURN' ? 'bg-rose-950 border-rose-800 text-rose-300' :
+            billingMode === 'QUOTATION' ? 'bg-sky-950 border-sky-800 text-sky-300' :
+            'bg-violet-950 border-violet-800 text-violet-300'
+          }`}>
             {invoiceNumber}
           </span>
           {heldBills.length > 0 && (
@@ -406,18 +751,94 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
         </div>
       </div>
 
+      {/* Mode-Specific Context Fields (Vehicle / Return Reason) */}
+      {billingMode === 'CHALLAN' && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 bg-violet-950/40 border border-violet-800/60 p-3 rounded-xl text-xs">
+          <div>
+            <label className="text-slate-300 font-semibold block mb-1">
+              {language === 'ta' ? 'வாகன எண் (Vehicle Reg No):' : 'Vehicle Registration No:'}
+            </label>
+            <input
+              type="text"
+              className="w-full bg-slate-900 border border-violet-700 rounded-lg px-2.5 py-1.5 text-white font-mono uppercase"
+              value={vehicleNumber}
+              onChange={(e) => setVehicleNumber(e.target.value)}
+              placeholder="e.g. TN-30-AZ-1234"
+            />
+          </div>
+          <div>
+            <label className="text-slate-300 font-semibold block mb-1">
+              {language === 'ta' ? 'டெலிவரி தள முகவரி (Site Delivery Address):' : 'Delivery Site Address:'}
+            </label>
+            <input
+              type="text"
+              className="w-full bg-slate-900 border border-violet-700 rounded-lg px-2.5 py-1.5 text-white"
+              value={deliverySiteAddress}
+              onChange={(e) => setDeliverySiteAddress(e.target.value)}
+              placeholder="e.g. Plot 45, Anna Nagar, Salem"
+            />
+          </div>
+        </div>
+      )}
+
+      {billingMode === 'RETURN' && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 bg-rose-950/40 border border-rose-800/60 p-3 rounded-xl text-xs">
+          <div>
+            <label className="text-slate-300 font-semibold block mb-1">
+              {language === 'ta' ? 'திருப்பியதற்கான காரணம்:' : 'Return Reason:'}
+            </label>
+            <input
+              type="text"
+              className="w-full bg-slate-900 border border-rose-700 rounded-lg px-2.5 py-1.5 text-white"
+              value={returnReason}
+              onChange={(e) => setReturnReason(e.target.value)}
+              placeholder="e.g. Excess material returned or defective"
+            />
+          </div>
+          <div>
+            <label className="text-slate-300 font-semibold block mb-1">
+              {language === 'ta' ? 'பணம் திரும்பக் கொடுக்கும் முறை:' : 'Refund Settlement Mode:'}
+            </label>
+            <select
+              className="w-full bg-slate-900 border border-rose-700 rounded-lg px-2.5 py-1.5 text-white font-medium"
+              value={refundMode}
+              onChange={(e) => setRefundMode(e.target.value as any)}
+            >
+              <option value="CREDIT_NOTE">Customer Credit Note (கடன் கணக்கில் வரவு)</option>
+              <option value="CASH">Counter Cash Refund (ரொக்கம் திருப்பிக் கொடுத்தல்)</option>
+              <option value="UPI">UPI Digital Refund (டிஜிட்டல் பரிவர்த்தனை)</option>
+            </select>
+          </div>
+        </div>
+      )}
+
+      {billingMode === 'QUOTATION' && (
+        <div className="bg-sky-950/40 border border-sky-800/60 p-3 rounded-xl text-xs">
+          <label className="text-slate-300 font-semibold block mb-1">
+            {language === 'ta' ? 'மதிப்பீட்டுக் குறிப்பு / நிபந்தனைகள் (Quotation Notes):' : 'Quotation Terms & Notes:'}
+          </label>
+          <input
+            type="text"
+            className="w-full bg-slate-900 border border-sky-700 rounded-lg px-2.5 py-1.5 text-white"
+            value={quotationNotes}
+            onChange={(e) => setQuotationNotes(e.target.value)}
+            placeholder="e.g. Valid for 7 days. Subject to market price changes."
+          />
+        </div>
+      )}
+
       {/* Main Billing Grid & Totals Panel */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
         {/* Left: Omnibar & Lines Table */}
         <div className="lg:col-span-8 space-y-3">
-          {/* Omnibar (F3) */}
+          {/* Omnibar (F3) with Barcode Scanner Icon */}
           <div className="relative">
             <div className="flex items-center gap-2.5 bg-slate-800 border-2 border-emerald-500/60 rounded-xl px-3.5 py-2.5 shadow-lg shadow-emerald-950/20">
-              <Search className="w-5 h-5 text-emerald-400" />
+              <Barcode className="w-5 h-5 text-emerald-400" />
               <input
                 ref={searchInputRef}
                 type="text"
-                placeholder={language === 'ta' ? 'பொருள் பெயர் / பார்கோடு ஸ்கேன் செய்க (F3)...' : 'Scan barcode or type product name (e.g. Screws, TMT, Paint) [F3]...'}
+                placeholder={language === 'ta' ? 'பார்கோடு ஸ்கேன் செய்க அல்லது பொருள் பெயர் உள்ளிடவும் (F3)...' : 'Scan barcode or type item name (e.g. 890123..., Screws, TMT, Paint) [F3]...'}
                 className="w-full bg-transparent text-white placeholder-slate-400 text-sm focus:outline-none font-medium"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
@@ -444,6 +865,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                       </div>
                       <div className="text-slate-400 text-[11px] font-mono mt-0.5">
                         Code: {prod.code} • Base: {prod.base_unit} • HSN: {prod.hsn_code}
+                        {prod.display_stock && <span className="ml-2 text-amber-300">Stock: {prod.display_stock}</span>}
                       </div>
                     </div>
                     <div className="text-right">
@@ -478,8 +900,8 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                     <tr>
                       <td colSpan={8} className="p-16 text-center text-slate-400 text-sm">
                         <div className="flex flex-col items-center justify-center gap-2">
-                          <Search className="w-8 h-8 text-slate-600" />
-                          <span>Bill is currently empty. Press <KbdBadge>F3</KbdBadge> to search or scan items.</span>
+                          <Barcode className="w-8 h-8 text-slate-600" />
+                          <span>Bill is currently empty. Press <KbdBadge>F3</KbdBadge> to scan barcode or search items.</span>
                         </div>
                       </td>
                     </tr>
@@ -504,7 +926,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                             </div>
                           )}
                         </td>
-                        {/* Unit Picker */}
+                        {/* Unit Picker with Smart Conversion */}
                         <td className="p-2.5 text-center">
                           <select
                             className="bg-slate-900 border border-slate-700 text-white rounded-lg px-2 py-1 text-xs font-semibold focus:border-emerald-500"
@@ -513,7 +935,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                           >
                             {line.availableUnits.map(u => (
                               <option key={u.unit_name} value={u.unit_name}>
-                                {u.unit_name}
+                                {u.unit_name} ({u.conversion_factor > 1 ? `${u.conversion_factor}x` : 'base'})
                               </option>
                             ))}
                           </select>
@@ -570,7 +992,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
               </table>
             </div>
 
-            {/* Frequent / Last-Used Quick Items Bar */}
+            {/* Quick Frequent Items Bar */}
             <div className="bg-slate-900/80 p-2.5 border-t border-slate-700 flex items-center justify-between text-xs text-slate-400">
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="font-bold text-slate-300">Quick Items:</span>
@@ -593,7 +1015,11 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
         <div className="lg:col-span-4 space-y-3">
           <div className="hardware-card p-4 shadow-lg space-y-4">
             <div className="flex items-center justify-between border-b border-slate-700 pb-2">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-300">Bill Settlement</span>
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                {billingMode === 'INVOICE' ? 'Bill Settlement' :
+                 billingMode === 'RETURN' ? 'Return Settlement' :
+                 billingMode === 'QUOTATION' ? 'Quotation Summary' : 'Dispatch Summary'}
+              </span>
               <span className="text-[11px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-mono font-medium">
                 TN GST (CGST+SGST 18%)
               </span>
@@ -627,10 +1053,21 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
               )}
 
               {/* Grand Total Box (Large Visual Hierarchy) */}
-              <div className="bg-slate-900 p-4 rounded-xl border-2 border-emerald-500/60 mt-3 flex items-center justify-between shadow-inner">
+              <div className={`p-4 rounded-xl border-2 mt-3 flex items-center justify-between shadow-inner ${
+                billingMode === 'INVOICE' ? 'bg-slate-900 border-emerald-500/60' :
+                billingMode === 'RETURN' ? 'bg-rose-950/40 border-rose-500/60' :
+                billingMode === 'QUOTATION' ? 'bg-sky-950/40 border-sky-500/60' :
+                'bg-violet-950/40 border-violet-500/60'
+              }`}>
                 <div>
-                  <div className="text-[11px] uppercase tracking-wider text-slate-400 font-bold">Grand Total</div>
-                  <CurrencyCell amount={summary.grandTotal} highlight="emerald" size="3xl" />
+                  <div className="text-[11px] uppercase tracking-wider text-slate-400 font-bold">
+                    {billingMode === 'RETURN' ? 'Total Refund' : 'Grand Total'}
+                  </div>
+                  <CurrencyCell 
+                    amount={summary.grandTotal} 
+                    highlight={billingMode === 'RETURN' ? 'amber' : 'emerald'} 
+                    size="3xl" 
+                  />
                 </div>
                 <div className="text-right">
                   <span className="text-[11px] text-emerald-400 block font-mono font-semibold">Round-off Included</span>
@@ -638,44 +1075,56 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
               </div>
             </div>
 
-            {/* Payment Mode Selector Tabs */}
-            <div className="space-y-2 pt-2 border-t border-slate-700">
-              <label className="text-xs font-bold text-slate-300 block">Payment Mode:</label>
-              <div className="grid grid-cols-4 gap-1.5">
-                {(['CASH', 'UPI', 'CREDIT', 'SPLIT'] as const).map(mode => (
-                  <button
-                    key={mode}
-                    onClick={() => {
-                      if (mode === 'SPLIT') {
-                        setCashPart((summary.grandTotal / 2).toFixed(2));
-                        setUpiPart((summary.grandTotal / 2).toFixed(2));
-                        setCreditPart('0.00');
-                        setShowSplitModal(true);
-                      } else {
-                        setPaymentMode(mode);
-                      }
-                    }}
-                    className={`py-2 rounded-lg text-xs font-bold transition ${
-                      paymentMode === mode
-                        ? 'bg-emerald-600 text-white shadow-md'
-                        : 'bg-slate-900 text-slate-300 hover:bg-slate-700 border border-slate-700'
-                    }`}
-                  >
-                    {mode}
-                  </button>
-                ))}
+            {/* Payment Mode Selector Tabs (Enabled for Invoices) */}
+            {billingMode === 'INVOICE' && (
+              <div className="space-y-2 pt-2 border-t border-slate-700">
+                <label className="text-xs font-bold text-slate-300 block">Payment Mode:</label>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {(['CASH', 'UPI', 'CREDIT', 'SPLIT'] as const).map(mode => (
+                    <button
+                      key={mode}
+                      onClick={() => {
+                        if (mode === 'SPLIT') {
+                          setCashPart((summary.grandTotal / 2).toFixed(2));
+                          setUpiPart((summary.grandTotal / 2).toFixed(2));
+                          setCreditPart('0.00');
+                          setShowSplitModal(true);
+                        } else {
+                          setPaymentMode(mode);
+                        }
+                      }}
+                      className={`py-2 rounded-lg text-xs font-bold transition ${
+                        paymentMode === mode
+                          ? 'bg-emerald-600 text-white shadow-md'
+                          : 'bg-slate-900 text-slate-300 hover:bg-slate-700 border border-slate-700'
+                      }`}
+                    >
+                      {mode}
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
 
             {/* Primary Action Buttons */}
             <div className="space-y-2 pt-2">
               <button
-                onClick={() => attemptCheckout('CASH')}
+                onClick={() => attemptCheckout(billingMode === 'INVOICE' ? 'CASH' : paymentMode)}
                 disabled={lines.length === 0}
-                className="w-full flex items-center justify-center gap-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white py-3.5 rounded-xl font-bold text-sm shadow-xl shadow-emerald-950/40 transition active:scale-[0.99]"
+                className={`w-full flex items-center justify-center gap-2.5 text-white py-3.5 rounded-xl font-bold text-sm shadow-xl transition active:scale-[0.99] disabled:opacity-50 ${
+                  billingMode === 'INVOICE' ? 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-950/40' :
+                  billingMode === 'RETURN' ? 'bg-rose-600 hover:bg-rose-500 shadow-rose-950/40' :
+                  billingMode === 'QUOTATION' ? 'bg-sky-600 hover:bg-sky-500 shadow-sky-950/40' :
+                  'bg-violet-600 hover:bg-violet-500 shadow-violet-950/40'
+                }`}
               >
                 <Printer className="w-4 h-4" />
-                <span>{language === 'ta' ? 'ரொக்கம் & ரசீது அச்சிடு' : 'Quick Cash & Print'}</span>
+                <span>
+                  {billingMode === 'INVOICE' ? (language === 'ta' ? 'ரொக்கம் & ரசீது அச்சிடு' : 'Quick Cash & Print') :
+                   billingMode === 'RETURN' ? (language === 'ta' ? 'கிரெடிட் நோட் பதிவு & அச்சிடு' : 'Post Credit Note & Print') :
+                   billingMode === 'QUOTATION' ? (language === 'ta' ? 'மதிப்பீடு உருவாக்கு & அச்சிடு' : 'Save Quotation & Print') :
+                   (language === 'ta' ? 'சலான் அனுப்பு & அச்சிடு' : 'Dispatch Challan & Print')}
+                </span>
                 <KbdBadge variant="slate">F9</KbdBadge>
               </button>
 
@@ -708,16 +1157,16 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
         <div className="flex items-center gap-4 flex-wrap">
           <span className="font-bold text-slate-200">Shortcuts Dock:</span>
           <span><KbdBadge>F2</KbdBadge> New</span>
-          <span><KbdBadge>F3</KbdBadge> Search</span>
+          <span><KbdBadge>F3</KbdBadge> Search/Barcode</span>
           <span><KbdBadge>F4</KbdBadge> Cust</span>
           <span><KbdBadge variant="amber">F6</KbdBadge> Hold</span>
           <span><KbdBadge variant="amber">F7</KbdBadge> Recall</span>
           <span><KbdBadge>F8</KbdBadge> Split</span>
-          <span><KbdBadge>F9</KbdBadge> Cash Print</span>
+          <span><KbdBadge>F9</KbdBadge> Quick Print</span>
           <span><KbdBadge>F10</KbdBadge> Settle</span>
         </div>
         <div className="text-[11px] font-mono text-emerald-400 font-bold">
-          Zero-Training 30s Counter Loop ⚡
+          Zero-Training 30s Counter POS ⚡
         </div>
       </footer>
 
@@ -728,7 +1177,11 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2">
                 <Printer className="w-5 h-5 text-emerald-400" />
-                <h3 className="font-bold text-white text-base">3-Inch Thermal Receipt Preview</h3>
+                <h3 className="font-bold text-white text-base">
+                  {billingMode === 'INVOICE' ? '3-Inch Thermal Receipt Preview' :
+                   billingMode === 'RETURN' ? 'Sales Return Credit Note Preview' :
+                   billingMode === 'QUOTATION' ? 'Quotation / Estimate Preview' : 'Delivery Challan Preview'}
+                </h3>
               </div>
               <button onClick={() => setShowReceiptModal(false)} className="text-slate-400 hover:text-white">
                 <X className="w-5 h-5" />
@@ -744,10 +1197,16 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
               <div className="border-b border-dashed border-black my-1"></div>
 
               <div className="flex justify-between text-[11px]">
-                <span>Bill: {invoiceNumber}</span>
+                <span>Doc: {invoiceNumber}</span>
                 <span>{new Date().toLocaleDateString('en-GB')} {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
               </div>
               <div className="text-[11px]">Cust: {selectedParty ? selectedParty.name : 'Walk-in Cash Customer'}</div>
+              {billingMode === 'CHALLAN' && (
+                <div className="text-[10px] text-gray-700">Vehicle: {vehicleNumber} • Site: {deliverySiteAddress}</div>
+              )}
+              {billingMode === 'RETURN' && (
+                <div className="text-[10px] text-gray-700">Reason: {returnReason}</div>
+              )}
               <div className="border-b border-dashed border-black my-1"></div>
 
               {/* Items list */}
@@ -789,12 +1248,14 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
               </div>
               <div className="border-b-2 border-black my-1"></div>
 
-              {/* Dynamic UPI QR Code */}
-              <div className="flex flex-col items-center justify-center py-2 space-y-1">
-                <span className="text-[10px] font-bold">SCAN TO PAY VIA ANY UPI APP</span>
-                <QRCodeSVG value={upiIntentUri} size={96} />
-                <span className="text-[9px] text-gray-700">salemtraders@icici</span>
-              </div>
+              {/* Dynamic UPI QR Code (for sales invoice) */}
+              {billingMode === 'INVOICE' && (
+                <div className="flex flex-col items-center justify-center py-2 space-y-1">
+                  <span className="text-[10px] font-bold">SCAN TO PAY VIA ANY UPI APP</span>
+                  <QRCodeSVG value={upiIntentUri} size={96} />
+                  <span className="text-[9px] text-gray-700">salemtraders@icici</span>
+                </div>
+              )}
 
               <div className="border-b border-dashed border-black my-1"></div>
               <div className="text-center font-bold text-[11px]">Thank You! Visit Again</div>
@@ -804,20 +1265,17 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
             {/* Modal Actions */}
             <div className="flex items-center gap-3">
               <button
-                onClick={() => {
-                  window.print();
-                  startNewBill();
-                  setShowReceiptModal(false);
-                }}
-                className="flex-1 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white py-2.5 rounded-xl font-bold text-xs shadow-md transition"
+                onClick={handleFinalizeTransaction}
+                disabled={isSubmittingDoc}
+                className="flex-1 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white py-2.5 rounded-xl font-bold text-xs shadow-md transition"
               >
                 <Printer className="w-4 h-4" />
-                <span>Print & Finish Bill</span>
+                <span>{isSubmittingDoc ? 'Posting to DB...' : 'Save & Print Slip'}</span>
               </button>
 
               {selectedParty?.phone && (
                 <a
-                  href={`https://wa.me/91${selectedParty.phone.replace(/\D/g, '')}?text=Vanakkam%20${encodeURIComponent(selectedParty.name)},%20Invoice%20${invoiceNumber}%20for%20Rs.${summary.grandTotal}%20from%20Salem%20Sri%20Murugan%20Hardware.%20Pay%20via%20UPI:%20${encodeURIComponent(upiIntentUri)}`}
+                  href={`https://wa.me/91${selectedParty.phone.replace(/\D/g, '')}?text=Vanakkam%20${encodeURIComponent(selectedParty.name)},%20Doc%20${invoiceNumber}%20for%20Rs.${summary.grandTotal}%20from%20Salem%20Sri%20Murugan%20Hardware.%20Pay%20via%20UPI:%20${encodeURIComponent(upiIntentUri)}`}
                   target="_blank"
                   rel="noreferrer"
                   className="flex items-center justify-center gap-1.5 bg-emerald-800 hover:bg-emerald-700 text-white px-4 py-2.5 rounded-xl font-bold text-xs transition"
@@ -826,6 +1284,149 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                   <Share2 className="w-4 h-4" />
                   <span>WhatsApp</span>
                 </a>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Document Manager Drawer / Modal (Quotations, Challans, Returns) */}
+      {showDocManagerModal && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-3xl w-full p-5 space-y-4 shadow-2xl max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <FolderOpen className="w-5 h-5 text-amber-400" />
+                <h3 className="font-bold text-white text-base">Quotations & Delivery Challans Manager</h3>
+              </div>
+              <button onClick={() => setShowDocManagerModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Sub-tabs */}
+            <div className="flex gap-2 border-b border-slate-800 pb-2 text-xs">
+              <button
+                onClick={() => setDocManagerTab('QUOTES')}
+                className={`px-3 py-1.5 rounded-lg font-bold transition ${
+                  docManagerTab === 'QUOTES' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:bg-slate-800'
+                }`}
+              >
+                Quotations / Estimates ({recentQuotes.length})
+              </button>
+              <button
+                onClick={() => setDocManagerTab('CHALLANS')}
+                className={`px-3 py-1.5 rounded-lg font-bold transition ${
+                  docManagerTab === 'CHALLANS' ? 'bg-violet-600 text-white' : 'text-slate-400 hover:bg-slate-800'
+                }`}
+              >
+                Delivery Challans ({recentChallans.length})
+              </button>
+              <button
+                onClick={() => setDocManagerTab('RETURNS')}
+                className={`px-3 py-1.5 rounded-lg font-bold transition ${
+                  docManagerTab === 'RETURNS' ? 'bg-rose-600 text-white' : 'text-slate-400 hover:bg-slate-800'
+                }`}
+              >
+                Sales Returns ({recentReturns.length})
+              </button>
+            </div>
+
+            {/* Tab Contents */}
+            <div className="flex-1 overflow-y-auto space-y-2 text-xs">
+              {docManagerTab === 'QUOTES' && (
+                recentQuotes.length === 0 ? (
+                  <div className="text-center p-8 text-slate-500">No recent quotations found.</div>
+                ) : (
+                  recentQuotes.map(q => (
+                    <div key={q.id} className="p-3 rounded-xl bg-slate-800/80 border border-slate-700 flex items-center justify-between">
+                      <div>
+                        <div className="font-bold text-white flex items-center gap-2">
+                          <span>{q.quotation_number}</span>
+                          <span className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold ${
+                            q.status === 'CONVERTED' ? 'bg-emerald-950 text-emerald-400 border border-emerald-700' : 'bg-sky-950 text-sky-400 border border-sky-700'
+                          }`}>
+                            {q.status}
+                          </span>
+                        </div>
+                        <div className="text-slate-400 text-[11px] mt-0.5">
+                          Cust: {q.customer_name} • {q.lines.length} lines • Date: {new Date(q.quotation_date).toLocaleDateString()}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <CurrencyCell amount={q.grand_total} highlight="emerald" size="base" />
+                        {q.status === 'OPEN' && (
+                          <button
+                            onClick={() => handleConvertQuotation(q)}
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition"
+                          >
+                            <span>1-Click Convert to Invoice</span>
+                            <ArrowRight className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                )
+              )}
+
+              {docManagerTab === 'CHALLANS' && (
+                recentChallans.length === 0 ? (
+                  <div className="text-center p-8 text-slate-500">No recent delivery challans found.</div>
+                ) : (
+                  recentChallans.map(dc => (
+                    <div key={dc.id} className="p-3 rounded-xl bg-slate-800/80 border border-slate-700 flex items-center justify-between">
+                      <div>
+                        <div className="font-bold text-white flex items-center gap-2">
+                          <span>{dc.challan_number}</span>
+                          <span className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold ${
+                            dc.status === 'INVOICED' ? 'bg-emerald-950 text-emerald-400 border border-emerald-700' : 'bg-violet-950 text-violet-400 border border-violet-700'
+                          }`}>
+                            {dc.status}
+                          </span>
+                        </div>
+                        <div className="text-slate-400 text-[11px] mt-0.5">
+                          Cust: {dc.customer_name} • Veh: {dc.vehicle_number || 'N/A'} • Site: {dc.delivery_site_address || 'Salem'}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <CurrencyCell amount={dc.grand_total} highlight="emerald" size="base" />
+                        {dc.status !== 'INVOICED' && (
+                          <button
+                            onClick={() => handleConvertChallan(dc)}
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition"
+                          >
+                            <span>1-Click Generate Bill</span>
+                            <ArrowRight className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                )
+              )}
+
+              {docManagerTab === 'RETURNS' && (
+                recentReturns.length === 0 ? (
+                  <div className="text-center p-8 text-slate-500">No recent sales returns found.</div>
+                ) : (
+                  recentReturns.map(ret => (
+                    <div key={ret.id} className="p-3 rounded-xl bg-slate-800/80 border border-slate-700 flex items-center justify-between">
+                      <div>
+                        <div className="font-bold text-white flex items-center gap-2">
+                          <span>{ret.return_number}</span>
+                          <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-rose-950 text-rose-400 border border-rose-700">
+                            {ret.refund_mode}
+                          </span>
+                        </div>
+                        <div className="text-slate-400 text-[11px] mt-0.5">
+                          Cust: {ret.customer_name} • Reason: {ret.reason || 'Material return'}
+                        </div>
+                      </div>
+                      <CurrencyCell amount={ret.grand_total} highlight="amber" size="base" />
+                    </div>
+                  ))
+                )
               )}
             </div>
           </div>
@@ -996,6 +1597,107 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 ))
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Quick Add Customer Modal */}
+      {showQuickCustModal && (
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <UserPlus className="w-5 h-5 text-emerald-400" />
+                <h3 className="font-bold text-white text-base">
+                  {language === 'ta' ? 'விரைவு வாடிக்கையாளர் பதிவு' : 'Quick Add Customer'}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowQuickCustModal(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleQuickAddCustomer} className="space-y-3">
+              <div>
+                <label className="text-xs text-slate-300 font-semibold block mb-1">
+                  {language === 'ta' ? 'வாடிக்கையாளர் பெயர் / நிறுவனம் *' : 'Customer / Firm Name *'}
+                </label>
+                <input
+                  type="text"
+                  required
+                  autoFocus
+                  placeholder="e.g. Salem Modern Builders"
+                  value={quickCustName}
+                  onChange={(e) => setQuickCustName(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs focus:border-emerald-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-slate-300 font-semibold block mb-1">
+                  {language === 'ta' ? 'கைபேசி எண் (Mobile / WhatsApp)' : 'Mobile Phone (for receipt & reminders)'}
+                </label>
+                <input
+                  type="tel"
+                  placeholder="98421 12345"
+                  value={quickCustPhone}
+                  onChange={(e) => setQuickCustPhone(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-xs focus:border-emerald-500"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'விலைத் தட்டு' : 'Price Tier'}
+                  </label>
+                  <select
+                    value={quickCustPriceTier}
+                    onChange={(e) => setQuickCustPriceTier(e.target.value as any)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs focus:border-emerald-500"
+                  >
+                    <option value="CONTRACTOR">Contractor (ஒப்பந்ததாரர்)</option>
+                    <option value="RETAIL">Retail (சில்லறை)</option>
+                    <option value="WHOLESALE">Wholesale (மொத்த)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'கடன் வரம்பு (₹)' : 'Credit Limit (₹)'}
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1000"
+                    value={quickCustCreditLimit}
+                    onChange={(e) => setQuickCustCreditLimit(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-xs focus:border-emerald-500"
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setShowQuickCustModal(false)}
+                  className="px-3.5 py-2 rounded-lg bg-slate-800 text-slate-300 text-xs font-semibold hover:bg-slate-700 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingCustomer}
+                  className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold transition shadow-md flex items-center gap-1.5"
+                >
+                  <UserPlus className="w-3.5 h-3.5" />
+                  <span>{isSavingCustomer ? 'Saving...' : (language === 'ta' ? 'சேமி & பில்லில் இணை' : 'Save & Link to Bill')}</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

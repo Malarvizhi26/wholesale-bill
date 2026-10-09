@@ -1,7 +1,7 @@
 import React from 'react';
 
 interface CurrencyCellProps {
-  amount: number;
+  amount: number | string;
   showSign?: boolean;
   highlight?: 'emerald' | 'amber' | 'red' | 'default';
   size?: 'sm' | 'base' | 'lg' | 'xl' | '2xl' | '3xl';
@@ -15,12 +15,13 @@ export const CurrencyCell: React.FC<CurrencyCellProps> = ({
   size = 'base',
   decimals = 2,
 }) => {
-  const formatted = Math.abs(amount).toLocaleString('en-IN', {
+  const num = Number(amount ?? 0);
+  const formatted = Math.abs(num).toLocaleString('en-IN', {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   });
 
-  const sign = amount < 0 ? '-' : (showSign && amount > 0 ? '+' : '');
+  const sign = num < 0 ? '-' : (showSign && num > 0 ? '+' : '');
 
   const colorStyles = {
     emerald: 'text-emerald-400 font-bold',

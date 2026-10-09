@@ -3,12 +3,19 @@
 from decimal import Decimal
 from typing import List, Optional
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.rls_session import get_tenant_db_session, get_current_tenant_id
 from app.models.tenant import Tenant
+from app.models.billing import (
+    SalesInvoice,
+    SalesReturn,
+    Quotation,
+    DeliveryChallan,
+)
 from app.modules.billing.invoice_calculator import (
     CalculatedInvoice,
     InvoiceCalculator,
@@ -18,9 +25,68 @@ from app.modules.billing.thermal_printer import (
     ShopProfile,
     ThermalReceiptGenerator,
 )
+from app.modules.billing.billing_service import BillingService
+from app.schemas.billing import (
+    ProductSearchItemSchema,
+    SalesInvoiceCreateSchema,
+    SalesInvoiceResponseSchema,
+    SalesReturnCreateSchema,
+    SalesReturnResponseSchema,
+    QuotationCreateSchema,
+    QuotationResponseSchema,
+    DeliveryChallanCreateSchema,
+    DeliveryChallanResponseSchema,
+    UnitDecomposeRequestSchema,
+    UnitDecomposeResponseSchema,
+)
 
 router = APIRouter(prefix="/billing", tags=["Billing"])
 
+
+# -----------------------------------------------------------------------------
+# 1. Barcode & Product Search & Unit Conversion
+# -----------------------------------------------------------------------------
+
+@router.get("/search", response_model=List[ProductSearchItemSchema])
+async def search_products(
+    q: str = Query(..., min_length=1, description="Barcode, code, name, or tamil name"),
+    godown_id: Optional[str] = Query(None, description="Godown ID for stock balance"),
+    price_list_id: Optional[str] = Query(None, description="Price list ID for selling price"),
+    limit: int = Query(25, ge=1, le=100),
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Instant counter search by barcode, product code, English name, or Tamil name."""
+    tenant_id = get_current_tenant_id()
+    return await BillingService.search_products_and_barcodes(
+        session=session,
+        tenant_id=tenant_id,
+        query=q,
+        godown_id=godown_id,
+        price_list_id=price_list_id,
+        limit=limit,
+    )
+
+
+@router.post("/unit-decompose", response_model=UnitDecomposeResponseSchema)
+async def decompose_unit_quantity(
+    payload: UnitDecomposeRequestSchema,
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Decompose transaction quantity into base units and packaging display string."""
+    tenant_id = get_current_tenant_id()
+    try:
+        return await BillingService.decompose_unit_quantity(
+            session=session,
+            tenant_id=tenant_id,
+            payload=payload,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# -----------------------------------------------------------------------------
+# 2. Calculation & Receipt Previews
+# -----------------------------------------------------------------------------
 
 class CalculateInvoiceRequest(BaseModel):
     place_of_supply_state_code: str = "33"
@@ -109,3 +175,281 @@ async def preview_thermal_receipt(
         "upi_intent": upi_intent,
         "receipt_text": receipt_text,
     }
+
+
+# -----------------------------------------------------------------------------
+# 3. GST Sales Invoices
+# -----------------------------------------------------------------------------
+
+@router.post("/invoices", response_model=SalesInvoiceResponseSchema, status_code=status.HTTP_201_CREATED)
+async def post_sales_invoice(
+    payload: SalesInvoiceCreateSchema,
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Post completed sales invoice: updates stock movements, stock balances, and party ledger."""
+    tenant_id = get_current_tenant_id()
+    try:
+        return await BillingService.create_sales_invoice(
+            session=session,
+            tenant_id=tenant_id,
+            payload=payload,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/invoices", response_model=List[SalesInvoiceResponseSchema])
+async def list_sales_invoices(
+    limit: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """List recent sales invoices."""
+    tenant_id = get_current_tenant_id()
+    stmt = (
+        select(SalesInvoice)
+        .where(SalesInvoice.tenant_id == tenant_id)
+        .options(selectinload(SalesInvoice.lines))
+        .order_by(desc(SalesInvoice.invoice_date))
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/invoices/{invoice_id}", response_model=SalesInvoiceResponseSchema)
+async def get_sales_invoice(
+    invoice_id: str,
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Retrieve full sales invoice details."""
+    tenant_id = get_current_tenant_id()
+    stmt = (
+        select(SalesInvoice)
+        .where(SalesInvoice.id == invoice_id, SalesInvoice.tenant_id == tenant_id)
+        .options(selectinload(SalesInvoice.lines))
+    )
+    inv = await session.scalar(stmt)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return inv
+
+
+# -----------------------------------------------------------------------------
+# 4. Sales Returns / Credit Notes
+# -----------------------------------------------------------------------------
+
+@router.post("/returns", response_model=SalesReturnResponseSchema, status_code=status.HTTP_201_CREATED)
+async def post_sales_return(
+    payload: SalesReturnCreateSchema,
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Record sales return / credit note: restores stock and updates customer ledger."""
+    tenant_id = get_current_tenant_id()
+    try:
+        return await BillingService.create_sales_return(
+            session=session,
+            tenant_id=tenant_id,
+            payload=payload,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/returns", response_model=List[SalesReturnResponseSchema])
+async def list_sales_returns(
+    limit: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """List recent sales returns / credit notes."""
+    tenant_id = get_current_tenant_id()
+    stmt = (
+        select(SalesReturn)
+        .where(SalesReturn.tenant_id == tenant_id)
+        .options(selectinload(SalesReturn.lines))
+        .order_by(desc(SalesReturn.return_date))
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/returns/{return_id}", response_model=SalesReturnResponseSchema)
+async def get_sales_return(
+    return_id: str,
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Retrieve full sales return details."""
+    tenant_id = get_current_tenant_id()
+    stmt = (
+        select(SalesReturn)
+        .where(SalesReturn.id == return_id, SalesReturn.tenant_id == tenant_id)
+        .options(selectinload(SalesReturn.lines))
+    )
+    ret = await session.scalar(stmt)
+    if not ret:
+        raise HTTPException(status_code=404, detail="Sales return not found")
+    return ret
+
+
+# -----------------------------------------------------------------------------
+# 5. Quotations / Estimates
+# -----------------------------------------------------------------------------
+
+class ConvertQuotationRequest(BaseModel):
+    payment_mode: str = "CASH"
+    paid_amount: Optional[Decimal] = None
+
+
+@router.post("/quotations", response_model=QuotationResponseSchema, status_code=status.HTTP_201_CREATED)
+async def post_quotation(
+    payload: QuotationCreateSchema,
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Create quotation / price estimate for contractors or retail buyers."""
+    tenant_id = get_current_tenant_id()
+    try:
+        return await BillingService.create_quotation(
+            session=session,
+            tenant_id=tenant_id,
+            payload=payload,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/quotations", response_model=List[QuotationResponseSchema])
+async def list_quotations(
+    limit: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """List quotations."""
+    tenant_id = get_current_tenant_id()
+    stmt = (
+        select(Quotation)
+        .where(Quotation.tenant_id == tenant_id)
+        .options(selectinload(Quotation.lines))
+        .order_by(desc(Quotation.quotation_date))
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/quotations/{quotation_id}", response_model=QuotationResponseSchema)
+async def get_quotation(
+    quotation_id: str,
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Get quotation details."""
+    tenant_id = get_current_tenant_id()
+    stmt = (
+        select(Quotation)
+        .where(Quotation.id == quotation_id, Quotation.tenant_id == tenant_id)
+        .options(selectinload(Quotation.lines))
+    )
+    q = await session.scalar(stmt)
+    if not q:
+        raise HTTPException(status_code=404, detail="Quotation not found")
+    return q
+
+
+@router.post("/quotations/{quotation_id}/convert-to-invoice", response_model=SalesInvoiceResponseSchema)
+async def convert_quotation(
+    quotation_id: str,
+    payload: ConvertQuotationRequest = ConvertQuotationRequest(),
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """1-Click convert open quotation into a real posted SalesInvoice."""
+    tenant_id = get_current_tenant_id()
+    try:
+        return await BillingService.convert_quotation_to_invoice(
+            session=session,
+            tenant_id=tenant_id,
+            quotation_id=quotation_id,
+            payment_mode=payload.payment_mode,
+            paid_amount=payload.paid_amount,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# -----------------------------------------------------------------------------
+# 6. Delivery Challans
+# -----------------------------------------------------------------------------
+
+class ConvertChallanRequest(BaseModel):
+    payment_mode: str = "CREDIT"
+    paid_amount: Optional[Decimal] = None
+
+
+@router.post("/challans", response_model=DeliveryChallanResponseSchema, status_code=status.HTTP_201_CREATED)
+async def post_delivery_challan(
+    payload: DeliveryChallanCreateSchema,
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Issue Delivery Challan: dispatches goods and decrements stock from godown."""
+    tenant_id = get_current_tenant_id()
+    try:
+        return await BillingService.create_delivery_challan(
+            session=session,
+            tenant_id=tenant_id,
+            payload=payload,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/challans", response_model=List[DeliveryChallanResponseSchema])
+async def list_delivery_challans(
+    limit: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """List delivery challans."""
+    tenant_id = get_current_tenant_id()
+    stmt = (
+        select(DeliveryChallan)
+        .where(DeliveryChallan.tenant_id == tenant_id)
+        .options(selectinload(DeliveryChallan.lines))
+        .order_by(desc(DeliveryChallan.challan_date))
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/challans/{challan_id}", response_model=DeliveryChallanResponseSchema)
+async def get_delivery_challan(
+    challan_id: str,
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Get delivery challan details."""
+    tenant_id = get_current_tenant_id()
+    stmt = (
+        select(DeliveryChallan)
+        .where(DeliveryChallan.id == challan_id, DeliveryChallan.tenant_id == tenant_id)
+        .options(selectinload(DeliveryChallan.lines))
+    )
+    dc = await session.scalar(stmt)
+    if not dc:
+        raise HTTPException(status_code=404, detail="Delivery challan not found")
+    return dc
+
+
+@router.post("/challans/{challan_id}/convert-to-invoice", response_model=SalesInvoiceResponseSchema)
+async def convert_challan(
+    challan_id: str,
+    payload: ConvertChallanRequest = ConvertChallanRequest(),
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Convert dispatched delivery challan into final bill without double-deducting stock."""
+    tenant_id = get_current_tenant_id()
+    try:
+        return await BillingService.convert_challan_to_invoice(
+            session=session,
+            tenant_id=tenant_id,
+            challan_id=challan_id,
+            payment_mode=payload.payment_mode,
+            paid_amount=payload.paid_amount,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

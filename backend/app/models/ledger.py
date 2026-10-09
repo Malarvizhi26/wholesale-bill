@@ -1,12 +1,10 @@
-"""Party Master, Append-Only Ledger Entries, and Payment Allocations ORM models."""
-
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
-from sqlalchemy import Boolean, Date, ForeignKey, Numeric, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import TenantScopedModel
+from app.models.base import TenantScopedModel, utc_now
 
 
 class Party(TenantScopedModel):
@@ -54,3 +52,17 @@ class PaymentAllocation(TenantScopedModel):
     payment_entry_id: Mapped[str] = mapped_column(String(36), ForeignKey("ledger_entries.id"), nullable=False)
     invoice_entry_id: Mapped[str] = mapped_column(String(36), ForeignKey("ledger_entries.id"), nullable=False)
     allocated_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+
+
+class CollectionReminderLog(TenantScopedModel):
+    """Dispatched WhatsApp and SMS payment reminders."""
+    __tablename__ = "collection_reminder_logs"
+
+    party_id: Mapped[str] = mapped_column(String(36), ForeignKey("parties.id"), nullable=False, index=True)
+    recipient_phone: Mapped[str] = mapped_column(String(20), nullable=False)
+    message_text: Mapped[str] = mapped_column(Text, nullable=False)
+    upi_payment_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="SENT", nullable=False)  # 'SENT', 'SIMULATED', 'FAILED'
+    dispatched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+

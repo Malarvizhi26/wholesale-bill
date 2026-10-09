@@ -108,3 +108,30 @@ async def test_list_parties():
         parties = response.json()
         assert len(parties) >= 1
         assert any(p["name"] == "Murugan Constructions" for p in parties)
+
+
+@pytest.mark.asyncio
+async def test_create_customer_party():
+    headers = {"X-Tenant-ID": DEMO_TENANT_ID}
+    payload = {
+        "party_type": "CUSTOMER",
+        "name": "Karthik Builders",
+        "phone": "9876543210",
+        "gstin": "33AAACK1234D1Z5",
+        "state_code": "33",
+        "credit_limit": "25000.00",
+        "credit_days": 15,
+        "opening_balance": "5000.00",
+        "price_list_code": "CONTRACTOR",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.post("/api/v1/ledger/parties", json=payload, headers=headers)
+        assert response.status_code == 201
+        data = response.json()
+        assert data["name"] == "Karthik Builders"
+        assert data["phone"] == "9876543210"
+        assert data["current_balance"] == "5000.00"
+        assert data["credit_limit"] == "25000.00"
+        assert data["credit_days"] == 15
+        assert data["state_code"] == "33"
+

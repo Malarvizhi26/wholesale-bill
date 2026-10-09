@@ -5,11 +5,12 @@ import { InventoryManager } from './components/InventoryManager';
 import { PartyLedger } from './components/PartyLedger';
 import { Dashboard } from './components/Dashboard';
 import { ReportsView } from './components/ReportsView';
+import { AIBusinessAssistant } from './components/AIBusinessAssistant';
 import type { Product, Party, Language } from './types';
 import { api } from './api/client';
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'pos' | 'dashboard' | 'inventory' | 'ledger' | 'reports'>('pos');
+  const [activeTab, setActiveTab] = useState<'pos' | 'dashboard' | 'inventory' | 'ledger' | 'reports' | 'assistant'>('pos');
   const [language, setLanguage] = useState<Language>('en');
   const [products, setProducts] = useState<Product[]>([]);
   const [parties, setParties] = useState<Party[]>([]);
@@ -41,6 +42,7 @@ export const App: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
+
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans">
       {/* Top Header Navbar */}
@@ -68,10 +70,32 @@ export const App: React.FC = () => {
                 language={language}
               />
             )}
-            {activeTab === 'dashboard' && <Dashboard language={language} />}
-            {activeTab === 'inventory' && <InventoryManager products={products} language={language} />}
-            {activeTab === 'ledger' && <PartyLedger parties={parties} language={language} />}
+            {activeTab === 'dashboard' && (
+              <Dashboard
+                language={language}
+                onOpenAssistant={() => setActiveTab('assistant')}
+              />
+            )}
+            {activeTab === 'inventory' && (
+              <InventoryManager
+                products={products}
+                language={language}
+                onProductAdded={(newProd) => setProducts((prev) => [newProd, ...prev])}
+              />
+            )}
+            {activeTab === 'ledger' && (
+              <PartyLedger
+                parties={parties}
+                language={language}
+              />
+            )}
             {activeTab === 'reports' && <ReportsView language={language} />}
+            {activeTab === 'assistant' && (
+              <AIBusinessAssistant
+                language={language}
+                onNavigateTab={(tab) => setActiveTab(tab)}
+              />
+            )}
           </>
         )}
       </main>
