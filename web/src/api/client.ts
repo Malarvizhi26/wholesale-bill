@@ -1,6 +1,7 @@
 import type { Product, Party, POSLineItem, BillSummary } from '../types';
 
-const API_BASE_URL = 'http://localhost:8000/api/v1';
+const API_BASE_URL = window.location.port === '8001' ? 'http://localhost:8001/api/v1' : 'http://localhost:8001/api/v1';
+const FALLBACK_API_URL = 'http://localhost:8000/api/v1';
 const DEFAULT_TENANT_ID = '00000000-0000-0000-0000-000000000001';
 
 // Initial fallback hardware catalogue for immediate offline/pilot counter usage
@@ -131,15 +132,33 @@ const INITIAL_PARTIES: Party[] = [
 class ApiClient {
   private isOnline = false;
 
+  private currentBaseUrl = API_BASE_URL;
+
   async checkHealth(): Promise<boolean> {
     try {
-      const res = await fetch(`${API_BASE_URL}/health`, { signal: AbortSignal.timeout(2000) });
-      this.isOnline = res.ok;
-      return res.ok;
+      const res = await fetch(`${API_BASE_URL}/health`, { signal: AbortSignal.timeout(1500) });
+      if (res.ok) {
+        this.currentBaseUrl = API_BASE_URL;
+        this.isOnline = true;
+        return true;
+      }
     } catch {
-      this.isOnline = false;
-      return false;
+      // try fallback 8000
     }
+
+    try {
+      const res2 = await fetch(`${FALLBACK_API_URL}/health`, { signal: AbortSignal.timeout(1500) });
+      if (res2.ok) {
+        this.currentBaseUrl = FALLBACK_API_URL;
+        this.isOnline = true;
+        return true;
+      }
+    } catch {
+      // both offline
+    }
+
+    this.isOnline = false;
+    return false;
   }
 
   getOnlineStatus(): boolean {
@@ -148,7 +167,7 @@ class ApiClient {
 
   async getProducts(search?: string): Promise<Product[]> {
     try {
-      const url = new URL(`${API_BASE_URL}/inventory/products`);
+      const url = new URL(`${this.currentBaseUrl}/inventory/products`);
       if (search) url.searchParams.set('search', search);
 
       const res = await fetch(url.toString(), {
@@ -181,7 +200,7 @@ class ApiClient {
 
   async getParties(): Promise<Party[]> {
     try {
-      const res = await fetch(`${API_BASE_URL}/ledger/parties`, {
+      const res = await fetch(`${this.currentBaseUrl}/ledger/parties`, {
         headers: { 'X-Tenant-ID': DEFAULT_TENANT_ID },
         signal: AbortSignal.timeout(3000),
       });
