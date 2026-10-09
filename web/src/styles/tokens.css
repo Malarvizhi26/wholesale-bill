@@ -1,0 +1,58 @@
+/* Design Tokens for Hardware Billing OS */
+:root {
+  /* 8px Spacing Grid */
+  --space-2xs: 4px;
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+
+  /* Surfaces & Canvas */
+  --bg-canvas: #0b1120;
+  --bg-surface: #1e293b;
+  --bg-surface-elevated: #334155;
+  --border-subtle: #334155;
+  --border-focus: #10b981;
+
+  /* Semantic Brand Colors */
+  --brand-emerald: #10b981;
+  --brand-emerald-dark: #059669;
+  --brand-emerald-glow: rgba(16, 185, 129, 0.25);
+  
+  --amber-warning: #f59e0b;
+  --amber-warning-dark: #d97706;
+  --amber-warning-glow: rgba(245, 158, 11, 0.2);
+
+  --red-danger: #ef4444;
+  --red-danger-dark: #dc2626;
+  --red-danger-glow: rgba(239, 68, 68, 0.2);
+
+  --blue-info: #3b82f6;
+
+  /* Typography */
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --mono-accent: #34d399;
+}
+
+/* Tabular Number Utilities */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Hardware High-Contrast Card Base */
+.hardware-card {
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.75rem;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2), 0 2px 4px -2px rgba(0, 0, 0, 0.2);
+}
+
+.hardware-card-elevated {
+  background-color: var(--bg-surface-elevated);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0.75rem;
+}

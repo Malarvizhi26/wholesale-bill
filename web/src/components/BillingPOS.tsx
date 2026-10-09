@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Search, Plus, Trash2, Printer, Share2, PauseCircle, 
-  AlertTriangle, X 
+  AlertTriangle, X, ShieldAlert, Split
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import type { Product, Party, POSLineItem, BillSummary, HeldBill, Language, ProductUnit } from '../types';
 import { api } from '../api/client';
+import { KbdBadge } from './ui/KbdBadge';
+import { CurrencyCell } from './ui/CurrencyCell';
 
 interface BillingPOSProps {
   products: Product[];
@@ -20,13 +22,24 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Product[]>([]);
   const [showSearchResults, setShowSearchResults] = useState(false);
+  const [selectedSearchIdx, setSelectedSearchIdx] = useState(0);
   const [paymentMode, setPaymentMode] = useState<'CASH' | 'UPI' | 'CREDIT' | 'SPLIT'>('CASH');
   const [paidAmount, setPaidAmount] = useState<number | undefined>(undefined);
   const [invoiceNumber, setInvoiceNumber] = useState('C1/26-27/0001');
 
-  // Modal states
+  // Split payment state
+  const [cashPart, setCashPart] = useState('');
+  const [upiPart, setUpiPart] = useState('');
+  const [creditPart, setCreditPart] = useState('');
+
+  // Modals
   const [showReceiptModal, setShowReceiptModal] = useState(false);
   const [showHoldModal, setShowHoldModal] = useState(false);
+  const [showSplitModal, setShowSplitModal] = useState(false);
+  const [showPinModal, setShowPinModal] = useState(false);
+  const [ownerPin, setOwnerPin] = useState('');
+  const [pinError, setPinError] = useState(false);
+  const [isPinApproved, setIsPinApproved] = useState(false);
   const [heldBills, setHeldBills] = useState<HeldBill[]>([]);
 
   // Refs for keyboard shortcuts
@@ -35,6 +48,12 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
 
   // Bill Summary
   const summary: BillSummary = api.calculateClientBill(lines, '33', '33', paidAmount);
+
+  // Credit limit breach check
+  const isCreditOverLimit = Boolean(
+    selectedParty && selectedParty.credit_limit > 0 && 
+    (selectedParty.current_balance + summary.grandTotal) > selectedParty.credit_limit
+  );
 
   // Keyboard shortcut listener
   useEffect(() => {
@@ -64,23 +83,41 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
         e.preventDefault();
         setShowHoldModal(true);
       }
+      // F8: Split Payment
+      else if (e.key === 'F8') {
+        e.preventDefault();
+        if (lines.length > 0) {
+          setCashPart((summary.grandTotal / 2).toFixed(2));
+          setUpiPart((summary.grandTotal / 2).toFixed(2));
+          setCreditPart('0.00');
+          setShowSplitModal(true);
+        }
+      }
       // F9: Quick Cash Bill & Print
       else if (e.key === 'F9') {
         e.preventDefault();
-        quickCashAndPrint();
+        attemptCheckout('CASH');
       }
-      // F10: Settle Bill
+      // F10: Settle Bill Modal
       else if (e.key === 'F10') {
         e.preventDefault();
-        setShowReceiptModal(true);
+        attemptCheckout(paymentMode);
+      }
+      // Escape closes open modals
+      else if (e.key === 'Escape') {
+        setShowSearchResults(false);
+        setShowReceiptModal(false);
+        setShowHoldModal(false);
+        setShowSplitModal(false);
+        setShowPinModal(false);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [lines, selectedParty, summary]);
+  }, [lines, selectedParty, summary, paymentMode, isCreditOverLimit, isPinApproved]);
 
-  // Product search filter
+  // Product search filter with keyboard arrow navigation
   useEffect(() => {
     if (!searchQuery.trim()) {
       setSearchResults([]);
@@ -96,7 +133,25 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     );
     setSearchResults(filtered);
     setShowSearchResults(filtered.length > 0);
+    setSelectedSearchIdx(0);
   }, [searchQuery, products]);
+
+  // Omnibar keyboard navigation (Up/Down/Enter)
+  const handleSearchKeyDown = (e: React.KeyboardEvent) => {
+    if (!showSearchResults || searchResults.length === 0) return;
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setSelectedSearchIdx(prev => (prev + 1) % searchResults.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setSelectedSearchIdx(prev => (prev - 1 + searchResults.length) % searchResults.length);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const chosen = searchResults[selectedSearchIdx];
+      if (chosen) addProductToBill(chosen);
+    }
+  };
 
   // Add Product to bill
   const addProductToBill = (prod: Product) => {
@@ -107,13 +162,12 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       can_sell: true
     };
 
-    // Rate lookup based on party price list
     let unitPrice = 0;
-    if (prod.code === 'SCR001') unitPrice = 185.00; // Box price
-    else if (prod.code === 'TMT012') unitPrice = 650.00; // Rod price
+    if (prod.code === 'SCR001') unitPrice = 185.00;
+    else if (prod.code === 'TMT012') unitPrice = 650.00;
     else if (prod.code === 'PNT001') unitPrice = 275.00;
     else if (prod.code === 'PIP001') unitPrice = 85.00;
-    else if (prod.code === 'GIW020') unitPrice = 1850.00; // Coil price
+    else if (prod.code === 'GIW020') unitPrice = 1850.00;
     else unitPrice = prod.purchase_price_base * 1.25;
 
     const newLine: POSLineItem = {
@@ -154,7 +208,6 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       const foundUnit = line.availableUnits.find(u => u.unit_name === unitName);
       if (!foundUnit) return line;
 
-      // Adjust price proportionately if switching to base unit
       let adjustedPrice = line.unitPrice;
       if (foundUnit.conversion_factor === 1 && line.conversionFactor > 1) {
         adjustedPrice = Math.round((line.unitPrice / line.conversionFactor) * 100) / 100;
@@ -181,6 +234,18 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
         ...line,
         quantity: safeQty,
         baseQuantity: safeQty * line.conversionFactor,
+      };
+    }));
+  };
+
+  // Update line scale weight
+  const handleScaleWeightChange = (lineId: string, weightKg: number) => {
+    setLines(prev => prev.map(line => {
+      if (line.id !== lineId) return line;
+      return {
+        ...line,
+        actualWeightKg: Math.max(0.01, weightKg),
+        baseQuantity: Math.max(0.01, weightKg),
       };
     }));
   };
@@ -213,7 +278,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     setSearchQuery('');
     setPaymentMode('CASH');
     setPaidAmount(undefined);
-    // increment bill series
+    setIsPinApproved(false);
     const num = parseInt(invoiceNumber.split('/')[2]) + 1;
     setInvoiceNumber(`C1/26-27/${num.toString().padStart(4, '0')}`);
   };
@@ -239,36 +304,55 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     setShowHoldModal(false);
   };
 
-  // Quick cash bill & print
-  const quickCashAndPrint = () => {
+  // Checkout with credit check protection
+  const attemptCheckout = (mode: 'CASH' | 'UPI' | 'CREDIT' | 'SPLIT') => {
     if (lines.length === 0) return;
-    setPaymentMode('CASH');
+    setPaymentMode(mode);
+
+    // If credit mode or customer exceeds limit without override PIN
+    if (mode === 'CREDIT' && isCreditOverLimit && !isPinApproved) {
+      setShowPinModal(true);
+      return;
+    }
+
     setShowReceiptModal(true);
   };
 
-  // Construct dynamic UPI Intent
-  const upiIntentUri = `upi://pay?pa=salemtraders@icici&pn=Salem%20Sri%20Murugan%20Hardware&am=${summary.grandTotal.toFixed(2)}&cu=INR&tn=Invoice_${invoiceNumber}`;
+  // Verify supervisor PIN
+  const handlePinSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (ownerPin === '1234' || ownerPin === '0000') {
+      setIsPinApproved(true);
+      setShowPinModal(false);
+      setShowReceiptModal(true);
+      setPinError(false);
+      setOwnerPin('');
+    } else {
+      setPinError(true);
+    }
+  };
 
-  // Credit limit breach check
-  const isCreditOverLimit = selectedParty && selectedParty.credit_limit > 0 && 
-    (selectedParty.current_balance + summary.grandTotal) > selectedParty.credit_limit;
+  // Dynamic UPI QR code URI
+  const upiIntentUri = `upi://pay?pa=salemtraders@icici&pn=Salem%20Sri%20Murugan%20Hardware&am=${summary.grandTotal.toFixed(2)}&cu=INR&tn=Invoice_${invoiceNumber}`;
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-4 space-y-4">
-      {/* Header bar: Customer Picker & Quick Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-12 gap-3 bg-slate-800/90 p-3 rounded-xl border border-slate-700 shadow-md">
-        {/* Customer selection */}
+      {/* Top Customer Station & Credit Bar */}
+      <div className="grid grid-cols-1 md:grid-cols-12 gap-3 hardware-card p-3 shadow-md">
+        {/* Customer Selector */}
         <div className="md:col-span-5 flex items-center gap-2">
-          <label className="text-xs font-semibold text-slate-300 whitespace-nowrap">
-            {language === 'ta' ? 'வாடிக்கையாளர் (F4):' : 'Customer (F4):'}
+          <label className="text-xs font-bold text-slate-300 whitespace-nowrap flex items-center gap-1.5">
+            <span>{language === 'ta' ? 'வாடிக்கையாளர்:' : 'Customer:'}</span>
+            <KbdBadge>F4</KbdBadge>
           </label>
           <select
             ref={partySelectRef}
-            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:border-emerald-500"
+            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:border-emerald-500 font-medium"
             value={selectedParty?.id || ''}
             onChange={(e) => {
               const party = parties.find(p => p.id === e.target.value) || null;
               setSelectedParty(party);
+              setIsPinApproved(false);
             }}
           >
             <option value="">Walk-in Retail (சில்லறை விற்பனை)</option>
@@ -280,75 +364,81 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
           </select>
         </div>
 
-        {/* Customer Balance & Limit alert */}
-        <div className="md:col-span-4 flex items-center gap-3 text-xs">
+        {/* Customer Balance & Credit Alert Badge */}
+        <div className="md:col-span-4 flex items-center gap-2 text-xs">
           {selectedParty ? (
-            <div className="flex items-center gap-2 bg-slate-900/80 px-3 py-1.5 rounded-lg border border-slate-700/60 w-full">
-              <span className="text-slate-400">Balance:</span>
-              <span className={`font-bold font-mono ${selectedParty.current_balance > 0 ? 'text-amber-400' : 'text-slate-300'}`}>
-                ₹{selectedParty.current_balance.toLocaleString()}
-              </span>
-              <span className="text-slate-500">•</span>
-              <span className="text-slate-400">Limit:</span>
-              <span className="font-mono text-slate-300">₹{selectedParty.credit_limit.toLocaleString()}</span>
+            <div className="flex items-center justify-between bg-slate-900/90 px-3 py-1.5 rounded-lg border border-slate-700/80 w-full">
+              <div className="flex items-center gap-2">
+                <span className="text-slate-400">Balance:</span>
+                <CurrencyCell amount={selectedParty.current_balance} highlight={selectedParty.current_balance > 0 ? 'amber' : 'default'} />
+                <span className="text-slate-600">|</span>
+                <span className="text-slate-400">Limit:</span>
+                <span className="font-mono text-slate-300">₹{selectedParty.credit_limit.toLocaleString()}</span>
+              </div>
               {isCreditOverLimit && (
-                <span className="ml-auto flex items-center gap-1 text-red-400 font-bold bg-red-950/60 px-1.5 py-0.5 rounded border border-red-800 text-[10px]">
+                <span className="flex items-center gap-1 text-red-400 font-bold bg-red-950/70 px-2 py-0.5 rounded border border-red-800 text-[10px]">
                   <AlertTriangle className="w-3 h-3" /> Over Limit
                 </span>
               )}
             </div>
           ) : (
-            <span className="text-slate-400 text-xs italic">Cash Retail • No Credit</span>
+            <span className="text-slate-400 text-xs italic bg-slate-900/50 px-3 py-1.5 rounded-lg border border-slate-800">
+              Retail Price List • Cash Settle
+            </span>
           )}
         </div>
 
-        {/* Series & Hold tray count */}
+        {/* Invoice Number & Held Tray */}
         <div className="md:col-span-3 flex items-center justify-end gap-2 text-xs">
-          <span className="bg-slate-900 px-2.5 py-1 rounded-lg border border-slate-700 font-mono text-emerald-400 font-semibold">
+          <span className="bg-slate-900 px-3 py-1 rounded-lg border border-slate-700 font-mono text-emerald-400 font-black tracking-wide">
             {invoiceNumber}
           </span>
           {heldBills.length > 0 && (
             <button
               onClick={() => setShowHoldModal(true)}
-              className="flex items-center gap-1 bg-amber-500/20 text-amber-300 border border-amber-500/30 px-2.5 py-1 rounded-lg font-medium hover:bg-amber-500/30 transition"
+              className="flex items-center gap-1.5 bg-amber-500/20 text-amber-300 border border-amber-500/40 px-2.5 py-1 rounded-lg font-bold hover:bg-amber-500/30 transition"
             >
               <PauseCircle className="w-3.5 h-3.5" />
-              <span>Held ({heldBills.length}) F7</span>
+              <span>Held ({heldBills.length})</span>
+              <KbdBadge variant="amber">F7</KbdBadge>
             </button>
           )}
         </div>
       </div>
 
-      {/* Main Billing Grid */}
+      {/* Main Billing Grid & Totals Panel */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-        {/* Left: Items Table & Autocomplete Search */}
+        {/* Left: Omnibar & Lines Table */}
         <div className="lg:col-span-8 space-y-3">
-          {/* Product Autocomplete Input (F3) */}
+          {/* Omnibar (F3) */}
           <div className="relative">
-            <div className="flex items-center gap-2 bg-slate-800 border-2 border-emerald-500/50 rounded-xl px-3 py-2 shadow-inner">
+            <div className="flex items-center gap-2.5 bg-slate-800 border-2 border-emerald-500/60 rounded-xl px-3.5 py-2.5 shadow-lg shadow-emerald-950/20">
               <Search className="w-5 h-5 text-emerald-400" />
               <input
                 ref={searchInputRef}
                 type="text"
-                placeholder={language === 'ta' ? 'பொருள் பெயர் / பார்கோடு தேடவும் (F3)...' : 'Scan barcode or search product name / Tamil name (F3)...'}
-                className="w-full bg-transparent text-white placeholder-slate-400 text-sm focus:outline-none"
+                placeholder={language === 'ta' ? 'பொருள் பெயர் / பார்கோடு ஸ்கேன் செய்க (F3)...' : 'Scan barcode or type product name (e.g. Screws, TMT, Paint) [F3]...'}
+                className="w-full bg-transparent text-white placeholder-slate-400 text-sm focus:outline-none font-medium"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={handleSearchKeyDown}
               />
-              <span className="kbf">F3</span>
+              <KbdBadge size="sm">F3</KbdBadge>
             </div>
 
-            {/* Dropdown Suggestions */}
+            {/* Dropdown Suggestions with Arrow Selection */}
             {showSearchResults && (
-              <div className="absolute top-full left-0 right-0 mt-1 bg-slate-800 border border-slate-700 rounded-xl shadow-2xl z-40 max-h-60 overflow-y-auto">
-                {searchResults.map((prod) => (
+              <div className="absolute top-full left-0 right-0 mt-1.5 bg-slate-800 border border-slate-600 rounded-xl shadow-2xl z-40 max-h-64 overflow-y-auto">
+                {searchResults.map((prod, idx) => (
                   <div
                     key={prod.id}
                     onClick={() => addProductToBill(prod)}
-                    className="flex items-center justify-between p-2.5 hover:bg-slate-700/80 cursor-pointer border-b border-slate-700/50 text-xs transition"
+                    className={`flex items-center justify-between p-3 cursor-pointer border-b border-slate-700/50 text-xs transition ${
+                      idx === selectedSearchIdx ? 'bg-emerald-950/60 border-l-4 border-l-emerald-400' : 'hover:bg-slate-700/60'
+                    }`}
                   >
                     <div>
-                      <div className="font-semibold text-white flex items-center gap-2">
+                      <div className="font-bold text-white flex items-center gap-2">
                         <span>{prod.name}</span>
                         {prod.tamil_name && <span className="text-emerald-400 text-xs">({prod.tamil_name})</span>}
                       </div>
@@ -357,8 +447,8 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                       </div>
                     </div>
                     <div className="text-right">
-                      <span className="px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 font-mono text-[11px]">
-                        + Add Line
+                      <span className="px-2 py-0.5 rounded bg-emerald-900/60 text-emerald-300 font-mono text-[11px] font-bold border border-emerald-700/50">
+                        + Add Line [Enter]
                       </span>
                     </div>
                   </div>
@@ -368,15 +458,15 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
           </div>
 
           {/* Active Bill Lines Table */}
-          <div className="bg-slate-800 rounded-xl border border-slate-700 shadow-md overflow-hidden min-h-[340px] flex flex-col justify-between">
+          <div className="hardware-card overflow-hidden min-h-[360px] flex flex-col justify-between">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-900/90 text-slate-300 border-b border-slate-700 uppercase font-mono tracking-wider text-[11px]">
                   <tr>
                     <th className="p-2.5 w-10">#</th>
-                    <th className="p-2.5">Item Name</th>
+                    <th className="p-2.5">Item Name & Tamil Label</th>
                     <th className="p-2.5 w-24 text-center">Unit</th>
-                    <th className="p-2.5 w-20 text-center">Qty</th>
+                    <th className="p-2.5 w-24 text-center">Qty</th>
                     <th className="p-2.5 w-24 text-right">Rate (₹)</th>
                     <th className="p-2.5 w-20 text-right">Disc</th>
                     <th className="p-2.5 w-28 text-right">Total (₹)</th>
@@ -386,10 +476,10 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 <tbody className="divide-y divide-slate-700/60 font-sans">
                   {lines.length === 0 ? (
                     <tr>
-                      <td colSpan={8} className="p-12 text-center text-slate-400 text-sm">
+                      <td colSpan={8} className="p-16 text-center text-slate-400 text-sm">
                         <div className="flex flex-col items-center justify-center gap-2">
-                          <Search className="w-8 h-8 text-slate-500" />
-                          <span>Bill is empty. Press <span className="kbf">F3</span> to search products.</span>
+                          <Search className="w-8 h-8 text-slate-600" />
+                          <span>Bill is currently empty. Press <KbdBadge>F3</KbdBadge> to search or scan items.</span>
                         </div>
                       </td>
                     </tr>
@@ -398,18 +488,26 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                       <tr key={line.id} className="hover:bg-slate-700/30 transition">
                         <td className="p-2.5 text-slate-400 font-mono">{idx + 1}</td>
                         <td className="p-2.5">
-                          <div className="font-semibold text-slate-100">{line.name}</div>
-                          {line.tamilName && <div className="text-slate-400 text-[10px]">{line.tamilName}</div>}
+                          <div className="font-bold text-slate-100">{line.name}</div>
+                          {line.tamilName && <div className="text-slate-400 text-[11px]">{line.tamilName}</div>}
                           {line.isVariableWeight && (
-                            <span className="text-[10px] px-1 py-0.2 rounded bg-amber-950 text-amber-300 font-mono">
-                              Scale Wt: {line.actualWeightKg} kg
-                            </span>
+                            <div className="flex items-center gap-1.5 mt-1">
+                              <span className="text-[10px] text-amber-300 font-mono">Scale Wt:</span>
+                              <input
+                                type="number"
+                                step="any"
+                                className="w-20 bg-slate-900 border border-amber-600 text-amber-300 px-1 py-0.5 rounded text-[11px] font-mono font-bold"
+                                value={line.actualWeightKg || ''}
+                                onChange={(e) => handleScaleWeightChange(line.id, parseFloat(e.target.value) || 0)}
+                              />
+                              <span className="text-[10px] text-amber-400 font-mono">kg</span>
+                            </div>
                           )}
                         </td>
                         {/* Unit Picker */}
                         <td className="p-2.5 text-center">
                           <select
-                            className="bg-slate-900 border border-slate-700 text-white rounded px-2 py-1 text-xs font-medium"
+                            className="bg-slate-900 border border-slate-700 text-white rounded-lg px-2 py-1 text-xs font-semibold focus:border-emerald-500"
                             value={line.unitName}
                             onChange={(e) => handleUnitChange(line.id, e.target.value)}
                           >
@@ -426,7 +524,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                             type="number"
                             min="0.01"
                             step="any"
-                            className="w-16 bg-slate-900 border border-slate-700 text-white text-center rounded px-1.5 py-1 text-xs font-mono font-bold"
+                            className="w-18 bg-slate-900 border border-slate-700 text-white text-center rounded-lg px-2 py-1 text-xs font-mono font-bold focus:border-emerald-500"
                             value={line.quantity}
                             onChange={(e) => handleQuantityChange(line.id, parseFloat(e.target.value) || 0)}
                           />
@@ -436,7 +534,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                           <input
                             type="number"
                             step="any"
-                            className="w-20 bg-slate-900 border border-slate-700 text-white text-right rounded px-1.5 py-1 text-xs font-mono font-bold"
+                            className="w-20 bg-slate-900 border border-slate-700 text-white text-right rounded-lg px-2 py-1 text-xs font-mono font-bold focus:border-emerald-500"
                             value={line.unitPrice}
                             onChange={(e) => handlePriceChange(line.id, parseFloat(e.target.value) || 0)}
                           />
@@ -446,20 +544,21 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                           <input
                             type="number"
                             step="any"
-                            className="w-16 bg-slate-900 border border-slate-700 text-amber-300 text-right rounded px-1.5 py-1 text-xs font-mono"
+                            className="w-16 bg-slate-900 border border-slate-700 text-amber-300 text-right rounded-lg px-1.5 py-1 text-xs font-mono focus:border-emerald-500"
                             value={line.discountValue}
                             onChange={(e) => handleDiscountChange(line.id, parseFloat(e.target.value) || 0)}
                           />
                         </td>
                         {/* Line Total */}
-                        <td className="p-2.5 text-right font-mono font-bold text-emerald-400 text-sm">
-                          ₹{line.lineTotal.toFixed(2)}
+                        <td className="p-2.5 text-right">
+                          <CurrencyCell amount={line.lineTotal} highlight="emerald" size="base" />
                         </td>
                         {/* Remove */}
                         <td className="p-2.5 text-center">
                           <button
                             onClick={() => removeLine(line.id)}
-                            className="text-slate-500 hover:text-red-400 transition"
+                            className="text-slate-500 hover:text-red-400 p-1 rounded transition"
+                            title="Remove Line Item"
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
@@ -471,84 +570,91 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
               </table>
             </div>
 
-            {/* Quick Add Bar / Frequent Items */}
-            <div className="bg-slate-900/60 p-2.5 border-t border-slate-700 flex items-center justify-between text-xs text-slate-400">
-              <div className="flex items-center gap-2">
-                <span className="font-medium text-slate-300">Quick Items:</span>
+            {/* Frequent / Last-Used Quick Items Bar */}
+            <div className="bg-slate-900/80 p-2.5 border-t border-slate-700 flex items-center justify-between text-xs text-slate-400">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="font-bold text-slate-300">Quick Items:</span>
                 {products.slice(0, 4).map(p => (
                   <button
                     key={p.id}
                     onClick={() => addProductToBill(p)}
-                    className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] transition"
+                    className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] font-medium transition"
                   >
                     + {p.name.split(' ')[0]}
                   </button>
                 ))}
               </div>
-              <span className="font-mono">{lines.length} Items</span>
+              <span className="font-mono text-slate-300">{lines.length} Line Items</span>
             </div>
           </div>
         </div>
 
-        {/* Right: Payment, Taxes & Settlement Summary */}
+        {/* Right: Checkout & Settlement Panel */}
         <div className="lg:col-span-4 space-y-3">
-          <div className="bg-slate-800 rounded-xl border border-slate-700 p-4 shadow-md space-y-4">
+          <div className="hardware-card p-4 shadow-lg space-y-4">
             <div className="flex items-center justify-between border-b border-slate-700 pb-2">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-300">Bill Breakdown</span>
-              <span className="text-[11px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-mono">
-                TN Intra-State GST (CGST+SGST)
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-300">Bill Settlement</span>
+              <span className="text-[11px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-mono font-medium">
+                TN GST (CGST+SGST 18%)
               </span>
             </div>
 
-            {/* Tax and Totals breakdown */}
+            {/* Calculations Breakdown */}
             <div className="space-y-2 text-xs">
               <div className="flex justify-between text-slate-300">
                 <span>Taxable Subtotal:</span>
-                <span className="font-mono font-semibold">₹{summary.subtotalTaxable.toFixed(2)}</span>
+                <CurrencyCell amount={summary.subtotalTaxable} />
               </div>
               <div className="flex justify-between text-slate-400">
                 <span>CGST (9%):</span>
-                <span className="font-mono">₹{summary.cgstTotal.toFixed(2)}</span>
+                <CurrencyCell amount={summary.cgstTotal} />
               </div>
               <div className="flex justify-between text-slate-400">
                 <span>SGST (9%):</span>
-                <span className="font-mono">₹{summary.sgstTotal.toFixed(2)}</span>
+                <CurrencyCell amount={summary.sgstTotal} />
               </div>
               {summary.totalDiscount > 0 && (
-                <div className="flex justify-between text-amber-400 font-medium">
-                  <span>Total Discount:</span>
-                  <span className="font-mono">-₹{summary.totalDiscount.toFixed(2)}</span>
+                <div className="flex justify-between text-amber-400 font-semibold">
+                  <span>Total Savings / Discount:</span>
+                  <CurrencyCell amount={-summary.totalDiscount} highlight="amber" />
                 </div>
               )}
               {summary.roundOff !== 0 && (
                 <div className="flex justify-between text-slate-400">
-                  <span>Round-off:</span>
+                  <span>Rupee Round-off:</span>
                   <span className="font-mono">{summary.roundOff > 0 ? `+₹${summary.roundOff.toFixed(2)}` : `-₹${Math.abs(summary.roundOff).toFixed(2)}`}</span>
                 </div>
               )}
 
-              {/* Grand Total Box */}
-              <div className="bg-slate-900 p-3.5 rounded-xl border-2 border-emerald-500/40 mt-3 flex items-center justify-between">
+              {/* Grand Total Box (Large Visual Hierarchy) */}
+              <div className="bg-slate-900 p-4 rounded-xl border-2 border-emerald-500/60 mt-3 flex items-center justify-between shadow-inner">
                 <div>
                   <div className="text-[11px] uppercase tracking-wider text-slate-400 font-bold">Grand Total</div>
-                  <div className="text-2xl font-black font-mono text-emerald-400">
-                    ₹{summary.grandTotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
-                  </div>
+                  <CurrencyCell amount={summary.grandTotal} highlight="emerald" size="3xl" />
                 </div>
                 <div className="text-right">
-                  <span className="text-[11px] text-slate-400 block font-mono">Round-off Included</span>
+                  <span className="text-[11px] text-emerald-400 block font-mono font-semibold">Round-off Included</span>
                 </div>
               </div>
             </div>
 
-            {/* Payment Mode Selector */}
+            {/* Payment Mode Selector Tabs */}
             <div className="space-y-2 pt-2 border-t border-slate-700">
-              <label className="text-xs font-semibold text-slate-300 block">Payment Mode:</label>
-              <div className="grid grid-cols-3 gap-2">
-                {(['CASH', 'UPI', 'CREDIT'] as const).map(mode => (
+              <label className="text-xs font-bold text-slate-300 block">Payment Mode:</label>
+              <div className="grid grid-cols-4 gap-1.5">
+                {(['CASH', 'UPI', 'CREDIT', 'SPLIT'] as const).map(mode => (
                   <button
                     key={mode}
-                    onClick={() => setPaymentMode(mode)}
+                    onClick={() => {
+                      if (mode === 'SPLIT') {
+                        setCashPart((summary.grandTotal / 2).toFixed(2));
+                        setUpiPart((summary.grandTotal / 2).toFixed(2));
+                        setCreditPart('0.00');
+                        setShowSplitModal(true);
+                      } else {
+                        setPaymentMode(mode);
+                      }
+                    }}
                     className={`py-2 rounded-lg text-xs font-bold transition ${
                       paymentMode === mode
                         ? 'bg-emerald-600 text-white shadow-md'
@@ -561,32 +667,35 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
               </div>
             </div>
 
-            {/* Action Buttons */}
+            {/* Primary Action Buttons */}
             <div className="space-y-2 pt-2">
               <button
-                onClick={quickCashAndPrint}
+                onClick={() => attemptCheckout('CASH')}
                 disabled={lines.length === 0}
-                className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white py-3 rounded-xl font-bold text-sm shadow-lg shadow-emerald-900/40 transition"
+                className="w-full flex items-center justify-center gap-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white py-3.5 rounded-xl font-bold text-sm shadow-xl shadow-emerald-950/40 transition active:scale-[0.99]"
               >
                 <Printer className="w-4 h-4" />
-                <span>{language === 'ta' ? 'ரசீது அச்சிடு (F9)' : 'Quick Cash & Print (F9)'}</span>
+                <span>{language === 'ta' ? 'ரொக்கம் & ரசீது அச்சிடு' : 'Quick Cash & Print'}</span>
+                <KbdBadge variant="slate">F9</KbdBadge>
               </button>
 
               <div className="grid grid-cols-2 gap-2">
                 <button
                   onClick={holdCurrentBill}
                   disabled={lines.length === 0}
-                  className="flex items-center justify-center gap-1.5 bg-slate-900 hover:bg-slate-700 disabled:opacity-50 text-slate-200 py-2 rounded-lg text-xs font-semibold border border-slate-700 transition"
+                  className="flex items-center justify-center gap-1.5 bg-slate-900 hover:bg-slate-700 disabled:opacity-50 text-slate-200 py-2.5 rounded-lg text-xs font-semibold border border-slate-700 transition"
                 >
-                  <PauseCircle className="w-4 h-4 text-amber-400" />
-                  <span>Hold Bill (F6)</span>
+                  <PauseCircle className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Hold Bill</span>
+                  <KbdBadge variant="amber">F6</KbdBadge>
                 </button>
                 <button
                   onClick={startNewBill}
-                  className="flex items-center justify-center gap-1.5 bg-slate-900 hover:bg-slate-700 text-slate-200 py-2 rounded-lg text-xs font-semibold border border-slate-700 transition"
+                  className="flex items-center justify-center gap-1.5 bg-slate-900 hover:bg-slate-700 text-slate-200 py-2.5 rounded-lg text-xs font-semibold border border-slate-700 transition"
                 >
-                  <Plus className="w-4 h-4 text-emerald-400" />
-                  <span>New Bill (F2)</span>
+                  <Plus className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>New Bill</span>
+                  <KbdBadge>F2</KbdBadge>
                 </button>
               </div>
             </div>
@@ -594,26 +703,27 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
         </div>
       </div>
 
-      {/* Keyboard Shortcuts Toolbar */}
-      <footer className="bg-slate-950 p-2.5 rounded-xl border border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
+      {/* Keyboard Shortcuts Bottom Dock */}
+      <footer className="bg-slate-950 p-3 rounded-xl border border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400 shadow-md">
         <div className="flex items-center gap-4 flex-wrap">
-          <span className="font-semibold text-slate-300">Keyboard Shortcuts:</span>
-          <span><span className="kbf">F2</span> New Bill</span>
-          <span><span className="kbf">F3</span> Item Search</span>
-          <span><span className="kbf">F4</span> Customer</span>
-          <span><span className="kbf">F6</span> Hold</span>
-          <span><span className="kbf">F7</span> Recall</span>
-          <span><span className="kbf">F9</span> Cash & Print</span>
-          <span><span className="kbf">F10</span> Settle</span>
+          <span className="font-bold text-slate-200">Shortcuts Dock:</span>
+          <span><KbdBadge>F2</KbdBadge> New</span>
+          <span><KbdBadge>F3</KbdBadge> Search</span>
+          <span><KbdBadge>F4</KbdBadge> Cust</span>
+          <span><KbdBadge variant="amber">F6</KbdBadge> Hold</span>
+          <span><KbdBadge variant="amber">F7</KbdBadge> Recall</span>
+          <span><KbdBadge>F8</KbdBadge> Split</span>
+          <span><KbdBadge>F9</KbdBadge> Cash Print</span>
+          <span><KbdBadge>F10</KbdBadge> Settle</span>
         </div>
-        <div className="text-[11px] font-mono text-emerald-400">
-          Target: 5 Lines &lt; 30s
+        <div className="text-[11px] font-mono text-emerald-400 font-bold">
+          Zero-Training 30s Counter Loop ⚡
         </div>
       </footer>
 
       {/* Thermal Receipt Preview Modal */}
       {showReceiptModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-5 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2">
@@ -640,7 +750,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
               <div className="text-[11px]">Cust: {selectedParty ? selectedParty.name : 'Walk-in Cash Customer'}</div>
               <div className="border-b border-dashed border-black my-1"></div>
 
-              {/* Items */}
+              {/* Items list */}
               <div className="space-y-1">
                 {lines.map(l => (
                   <div key={l.id} className="flex justify-between text-[11px]">
@@ -722,9 +832,134 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
         </div>
       )}
 
+      {/* Supervisor Owner PIN Modal */}
+      {showPinModal && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-red-500/50 rounded-2xl max-w-sm w-full p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center gap-2.5 text-red-400">
+              <ShieldAlert className="w-6 h-6" />
+              <h3 className="font-bold text-white text-base">Credit Limit Exceeded</h3>
+            </div>
+
+            <p className="text-xs text-slate-300">
+              Customer <strong className="text-white">{selectedParty?.name}</strong> has exceeded their credit limit of ₹{selectedParty?.credit_limit.toLocaleString()}. Enter Owner PIN to authorize credit sale:
+            </p>
+
+            <form onSubmit={handlePinSubmit} className="space-y-3">
+              <div className="relative">
+                <input
+                  type="password"
+                  maxLength={4}
+                  autoFocus
+                  placeholder="Enter 4-digit PIN..."
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-center text-lg font-mono tracking-widest text-white focus:border-red-500"
+                  value={ownerPin}
+                  onChange={(e) => setOwnerPin(e.target.value)}
+                />
+              </div>
+
+              {pinError && (
+                <div className="text-xs text-red-400 text-center font-bold">
+                  Invalid PIN. Default demo PIN is 1234 or 0000.
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowPinModal(false)}
+                  className="px-3 py-2 rounded-lg bg-slate-800 text-slate-300 text-xs font-semibold hover:bg-slate-700 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-bold transition shadow"
+                >
+                  Authorize Sale
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Split Payment Modal (F8) */}
+      {showSplitModal && (
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <Split className="w-5 h-5 text-emerald-400" />
+                <h3 className="font-bold text-white text-base">Split Payment Breakdown</h3>
+              </div>
+              <button onClick={() => setShowSplitModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="text-xs text-slate-300">
+              Total Bill: <CurrencyCell amount={summary.grandTotal} highlight="emerald" size="lg" />
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="text-xs text-slate-400 block mb-1">Cash Payment (₹):</label>
+                <input
+                  type="number"
+                  step="any"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-sm"
+                  value={cashPart}
+                  onChange={(e) => setCashPart(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-slate-400 block mb-1">UPI Digital Payment (₹):</label>
+                <input
+                  type="number"
+                  step="any"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-sm"
+                  value={upiPart}
+                  onChange={(e) => setUpiPart(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-slate-400 block mb-1">Credit / Udhar (₹):</label>
+                <input
+                  type="number"
+                  step="any"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-sm"
+                  value={creditPart}
+                  onChange={(e) => setCreditPart(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                onClick={() => setShowSplitModal(false)}
+                className="px-3 py-2 rounded-lg bg-slate-800 text-slate-300 text-xs font-semibold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  setPaymentMode('SPLIT');
+                  setShowSplitModal(false);
+                  setShowReceiptModal(true);
+                }}
+                className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow"
+              >
+                Confirm Split & Proceed
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Held Bills Tray Modal (F7) */}
       {showHoldModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-5 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2">
@@ -738,7 +973,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
 
             <div className="space-y-2 max-h-72 overflow-y-auto">
               {heldBills.length === 0 ? (
-                <div className="text-center p-6 text-slate-400 text-xs">No held bills found.</div>
+                <div className="text-center p-8 text-slate-400 text-xs">No held bills found in memory.</div>
               ) : (
                 heldBills.map(h => (
                   <div key={h.id} className="flex items-center justify-between p-3 rounded-xl bg-slate-800 border border-slate-700 hover:border-emerald-500 transition">
@@ -749,7 +984,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                       </div>
                     </div>
                     <div className="flex items-center gap-3">
-                      <span className="font-bold font-mono text-emerald-400 text-sm">₹{h.grandTotal.toFixed(2)}</span>
+                      <CurrencyCell amount={h.grandTotal} highlight="emerald" size="base" />
                       <button
                         onClick={() => recallBill(h)}
                         className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition"

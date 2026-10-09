@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
-import { Search, Upload, CheckCircle, Package } from 'lucide-react';
+import { Search, Upload, CheckCircle, Package, FileSpreadsheet } from 'lucide-react';
 import type { Product, Language } from '../types';
+import { CurrencyCell } from './ui/CurrencyCell';
+import { DecomposedUnitBadge } from './ui/DecomposedUnitBadge';
 
 interface InventoryManagerProps {
   products: Product[];
@@ -32,16 +34,16 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
   return (
     <div className="max-w-7xl mx-auto px-4 py-4 space-y-4">
       {/* Header bar */}
-      <div className="flex flex-col sm:flex-row items-center justify-between gap-3 bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-md">
+      <div className="flex flex-col sm:flex-row items-center justify-between gap-3 hardware-card p-4 shadow-md">
         <div>
           <h2 className="text-lg font-bold text-white flex items-center gap-2">
             <Package className="w-5 h-5 text-emerald-400" />
-            <span>{language === 'ta' ? 'சரக்கு & விலைப்பட்டியல்' : 'Smart Inventory & Stock Ledger'}</span>
+            <span>{language === 'ta' ? 'சரக்கு இருப்பு & விலைப்பட்டியல்' : 'Smart Inventory & Stock Ledger'}</span>
           </h2>
           <p className="text-xs text-slate-400 mt-0.5">
             {language === 'ta'
               ? 'அனைத்து சரக்குகளும் சிறிய அலகில் (Base Unit) துல்லியமாக நிர்வகிக்கப்படுகிறது'
-              : 'Stored in atomic base units with live mixed packaging unit decomposition'}
+              : 'Stored in atomic base units with live packaging unit decomposition (e.g. 963 pcs -> 9 Box 63 pcs)'}
           </p>
         </div>
 
@@ -52,7 +54,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
             <input
               type="text"
               placeholder={language === 'ta' ? 'தேடுக...' : 'Search items or HSN...'}
-              className="w-full bg-slate-900 border border-slate-700 rounded-lg pl-9 pr-3 py-1.5 text-xs text-white placeholder-slate-400 focus:border-emerald-500"
+              className="w-full bg-slate-900 border border-slate-700 rounded-lg pl-9 pr-3 py-1.5 text-xs text-white placeholder-slate-400 focus:border-emerald-500 font-medium"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
             />
@@ -70,7 +72,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
       </div>
 
       {/* Products Table */}
-      <div className="bg-slate-800 rounded-xl border border-slate-700 shadow-md overflow-hidden">
+      <div className="hardware-card overflow-hidden shadow-md">
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
             <thead className="bg-slate-900/90 text-slate-300 uppercase font-mono tracking-wider border-b border-slate-700 text-[11px]">
@@ -88,11 +90,11 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                 <tr key={p.id} className="hover:bg-slate-700/30 transition">
                   <td className="p-3 font-mono font-bold text-emerald-400">{p.code}</td>
                   <td className="p-3">
-                    <div className="font-semibold text-white text-sm">{p.name}</div>
+                    <div className="font-bold text-white text-sm">{p.name}</div>
                     {p.tamil_name && <div className="text-slate-400 text-xs mt-0.5">{p.tamil_name}</div>}
                     {p.is_variable_weight && (
                       <span className="inline-block mt-1 text-[10px] px-2 py-0.5 rounded bg-amber-950/80 text-amber-300 border border-amber-800/60 font-mono">
-                        Variable Weight (Weighed Scale Item)
+                        Variable Weight (Scale Item)
                       </span>
                     )}
                   </td>
@@ -100,22 +102,22 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                   <td className="p-3">
                     <div className="flex flex-wrap gap-1">
                       {p.units.map(u => (
-                        <span key={u.unit_name} className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px] text-slate-300">
+                        <span key={u.unit_name} className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px] text-slate-300 font-mono">
                           1 {u.unit_name} = {u.conversion_factor} {p.base_unit}
                         </span>
                       ))}
                     </div>
                   </td>
-                  <td className="p-3 text-right font-mono font-semibold text-slate-200">
-                    ₹{p.purchase_price_base.toFixed(2)} / {p.base_unit}
+                  <td className="p-3 text-right">
+                    <CurrencyCell amount={p.purchase_price_base} />
+                    <span className="text-[10px] text-slate-400 block font-mono">/ {p.base_unit}</span>
                   </td>
                   <td className="p-3 text-right">
-                    <div className="font-mono font-bold text-emerald-400 text-sm">
-                      {p.display_stock || `${p.stock_base || 0} ${p.base_unit}`}
-                    </div>
-                    <div className="text-[10px] text-slate-400 font-mono">
-                      Atomic Base: {p.stock_base || 0} {p.base_unit}
-                    </div>
+                    <DecomposedUnitBadge
+                      displayText={p.display_stock}
+                      baseQuantity={p.stock_base || 0}
+                      baseUnit={p.base_unit}
+                    />
                   </td>
                 </tr>
               ))}
@@ -126,11 +128,11 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
 
       {/* CSV Bulk Import Modal */}
       {showImportModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2">
-                <Upload className="w-5 h-5 text-emerald-400" />
+                <FileSpreadsheet className="w-5 h-5 text-emerald-400" />
                 <h3 className="font-bold text-white text-base">Bulk Catalogue Import (Excel / CSV)</h3>
               </div>
               <button onClick={() => setShowImportModal(false)} className="text-slate-400 hover:text-white">✕</button>

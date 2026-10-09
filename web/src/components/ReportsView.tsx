@@ -1,6 +1,7 @@
 import React from 'react';
 import { FileText, Download, Printer } from 'lucide-react';
 import type { Language } from '../types';
+import { CurrencyCell } from './ui/CurrencyCell';
 
 interface ReportsViewProps {
   language: Language;
@@ -10,7 +11,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
   return (
     <div className="max-w-7xl mx-auto px-4 py-4 space-y-4">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row items-center justify-between gap-3 bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-md">
+      <div className="flex flex-col sm:flex-row items-center justify-between gap-3 hardware-card p-4 shadow-md">
         <div>
           <h2 className="text-lg font-bold text-white flex items-center gap-2">
             <FileText className="w-5 h-5 text-emerald-400" />
@@ -32,7 +33,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
             <span>Print Report</span>
           </button>
           <button
-            onClick={() => alert("Downloading GSTR-1 Excel Summary...")}
+            onClick={() => alert("Exporting GSTR-1 Excel summary with exact HSN splits...")}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow"
           >
             <Download className="w-3.5 h-3.5" />
@@ -42,10 +43,13 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
       </div>
 
       {/* HSN Summary Table for GSTR-1 */}
-      <div className="bg-slate-800 rounded-xl border border-slate-700 shadow-md p-4 space-y-3">
-        <div className="flex items-center justify-between border-b border-slate-700 pb-2">
+      <div className="hardware-card p-4 space-y-3 shadow-md">
+        <div className="flex items-center justify-between border-b border-slate-700 pb-2.5">
           <h3 className="font-bold text-white text-sm">GSTR-1 HSN-Wise Summary (Today)</h3>
-          <span className="text-xs font-mono text-emerald-400">Total Taxable: ₹52,430.00</span>
+          <span className="text-xs font-mono text-emerald-400 flex items-center gap-1.5 font-bold">
+            <span>Total Taxable:</span>
+            <CurrencyCell amount={52430} highlight="emerald" size="base" />
+          </span>
         </div>
 
         <div className="overflow-x-auto">
@@ -61,22 +65,30 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
                 <th className="p-2.5 text-right">Total Invoice Value</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-700/60 font-sans font-mono">
+            <tbody className="divide-y divide-slate-700/60 font-sans">
               {[
-                { hsn: '7214', desc: 'TMT Steel Bars', rate: '18%', taxable: 24500.00, cgst: 2205.00, sgst: 2205.00, total: 28910.00 },
+                { hsn: '7214', desc: 'TMT Steel Bars & Rods', rate: '18%', taxable: 24500.00, cgst: 2205.00, sgst: 2205.00, total: 28910.00 },
                 { hsn: '7318', desc: 'SS Screws & Fasteners', rate: '18%', taxable: 8450.00, cgst: 760.50, sgst: 760.50, total: 9971.00 },
                 { hsn: '3208', desc: 'Paints & Primers', rate: '18%', taxable: 11200.00, cgst: 1008.00, sgst: 1008.00, total: 13216.00 },
                 { hsn: '3917', desc: 'CPVC Pipes & Fittings', rate: '18%', taxable: 5100.00, cgst: 459.00, sgst: 459.00, total: 6018.00 },
                 { hsn: '7217', desc: 'GI Binding Wire', rate: '18%', taxable: 3180.00, cgst: 286.20, sgst: 286.20, total: 3752.40 },
               ].map((row, idx) => (
                 <tr key={idx} className="hover:bg-slate-700/30 transition text-slate-200">
-                  <td className="p-2.5 font-bold text-emerald-400">{row.hsn}</td>
-                  <td className="p-2.5 font-sans">{row.desc}</td>
-                  <td className="p-2.5 text-center text-slate-400">{row.rate}</td>
-                  <td className="p-2.5 text-right font-semibold">₹{row.taxable.toFixed(2)}</td>
-                  <td className="p-2.5 text-right text-slate-400">₹{row.cgst.toFixed(2)}</td>
-                  <td className="p-2.5 text-right text-slate-400">₹{row.sgst.toFixed(2)}</td>
-                  <td className="p-2.5 text-right font-bold text-white">₹{row.total.toFixed(2)}</td>
+                  <td className="p-2.5 font-bold font-mono text-emerald-400">{row.hsn}</td>
+                  <td className="p-2.5 font-medium">{row.desc}</td>
+                  <td className="p-2.5 text-center font-mono text-slate-400">{row.rate}</td>
+                  <td className="p-2.5 text-right">
+                    <CurrencyCell amount={row.taxable} size="sm" />
+                  </td>
+                  <td className="p-2.5 text-right text-slate-400">
+                    <CurrencyCell amount={row.cgst} size="sm" />
+                  </td>
+                  <td className="p-2.5 text-right text-slate-400">
+                    <CurrencyCell amount={row.sgst} size="sm" />
+                  </td>
+                  <td className="p-2.5 text-right">
+                    <CurrencyCell amount={row.total} highlight="emerald" size="sm" />
+                  </td>
                 </tr>
               ))}
             </tbody>
