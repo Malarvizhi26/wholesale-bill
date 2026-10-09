@@ -1,0 +1,21 @@
+{
+  "name": "hardware-billing-os",
+  "version": "1.0.0",
+  "description": "Offline-Capable Cloud Hardware & Building Material OS for Tamil Nadu Retailers",
+  "scripts": {
+    "web:dev": "npm --prefix web run dev",
+    "web:build": "npm --prefix web run build",
+    "backend:dev": ".venv\\Scripts\\uvicorn app.main:app --app-dir backend --reload --port 8000",
+    "backend:test": ".venv\\Scripts\\python -m pytest backend/app/tests -v"
+  },
+  "keywords": [
+    "hardware-billing",
+    "pos",
+    "inventory",
+    "ledger",
+    "gst",
+    "tamil-nadu"
+  ],
+  "author": "",
+  "license": "ISC"
+}

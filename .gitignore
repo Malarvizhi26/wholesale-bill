@@ -30,6 +30,8 @@ htmlcov/
 node_modules/
 .next/
 out/
+dist/
+web/dist/
 desktop/src-tauri/target/
 
 # OS / IDE
