@@ -13,6 +13,7 @@ from app.modules.billing.router import router as billing_router
 from app.modules.ledger.router import router as ledger_router
 from app.modules.reports.router import router as reports_router
 from app.modules.ai_assistant.router import router as ai_router
+from app.modules.auth.router import router as auth_router
 
 
 @asynccontextmanager
@@ -69,6 +70,7 @@ app.include_router(billing_router, prefix=settings.API_V1_STR)
 app.include_router(ledger_router, prefix=settings.API_V1_STR)
 app.include_router(reports_router, prefix=settings.API_V1_STR)
 app.include_router(ai_router, prefix=settings.API_V1_STR)
+app.include_router(auth_router, prefix=settings.API_V1_STR)
 
 
 if __name__ == "__main__":

@@ -3,15 +3,15 @@ import {
   Plus, Trash2, Printer, Share2, PauseCircle, 
   AlertTriangle, X, ShieldAlert, Split, UserPlus,
   FileText, RotateCcw, Truck, Receipt, CheckCircle2,
-  FolderOpen, ArrowRight, Barcode
+  FolderOpen, ArrowRight, Barcode, Pencil
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import type { 
   Product, Party, POSLineItem, BillSummary, HeldBill, Language, 
-  ProductUnit, PartyCreateInput, BillingMode, QuotationRecord, 
-  DeliveryChallanRecord, SalesReturnRecord
+  ProductUnit, PartyCreateInput, PartyUpdateInput, BillingMode, QuotationRecord, 
+  DeliveryChallanRecord, SalesReturnRecord, ProductSearchItem, SalesInvoiceRecord
 } from '../types';
-import { api } from '../api/client';
+import { api, roundHalfUp } from '../api/client';
 import { KbdBadge } from './ui/KbdBadge';
 import { CurrencyCell } from './ui/CurrencyCell';
 
@@ -20,9 +20,13 @@ interface BillingPOSProps {
   parties: Party[];
   language: Language;
   onAddParty?: (data: PartyCreateInput) => Promise<Party>;
+  onUpdateParty?: (partyId: string, data: PartyUpdateInput) => Promise<Party>;
+  // Called after any document is posted so parent can re-fetch party balances & stock
+  onDocumentSaved?: () => void;
+  pendingSyncCount?: number;
 }
 
-export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, language, onAddParty }) => {
+export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, language, onAddParty, onUpdateParty, onDocumentSaved, pendingSyncCount }) => {
   // Billing Mode: Tax Invoice, Sales Return, Quotation, or Delivery Challan
   const [billingMode, setBillingMode] = useState<BillingMode>('INVOICE');
 
@@ -52,6 +56,17 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
   const [quickCustPriceTier, setQuickCustPriceTier] = useState<'CONTRACTOR' | 'RETAIL' | 'WHOLESALE'>('CONTRACTOR');
   const [isSavingCustomer, setIsSavingCustomer] = useState(false);
 
+  // Edit Customer Modal State
+  const [showEditCustModal, setShowEditCustModal] = useState(false);
+  const [editCustName, setEditCustName] = useState('');
+  const [editCustPhone, setEditCustPhone] = useState('');
+  const [editCustGstin, setEditCustGstin] = useState('');
+  const [editCustPriceTier, setEditCustPriceTier] = useState<'CONTRACTOR' | 'RETAIL' | 'WHOLESALE'>('CONTRACTOR');
+  const [editCustCreditLimit, setEditCustCreditLimit] = useState('25000');
+  const [editCustCreditDays, setEditCustCreditDays] = useState('30');
+  const [editCustAddress, setEditCustAddress] = useState('');
+  const [isUpdatingCustomer, setIsUpdatingCustomer] = useState(false);
+
   // Split payment state
   const [cashPart, setCashPart] = useState('');
   const [upiPart, setUpiPart] = useState('');
@@ -63,40 +78,77 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
   const [showSplitModal, setShowSplitModal] = useState(false);
   const [showPinModal, setShowPinModal] = useState(false);
   const [showDocManagerModal, setShowDocManagerModal] = useState(false);
-  const [docManagerTab, setDocManagerTab] = useState<'QUOTES' | 'CHALLANS' | 'RETURNS'>('QUOTES');
+  const [docManagerTab, setDocManagerTab] = useState<'INVOICES' | 'QUOTES' | 'CHALLANS' | 'RETURNS'>('INVOICES');
+  const [recentInvoices, setRecentInvoices] = useState<SalesInvoiceRecord[]>([]);
   const [recentQuotes, setRecentQuotes] = useState<QuotationRecord[]>([]);
   const [recentChallans, setRecentChallans] = useState<DeliveryChallanRecord[]>([]);
   const [recentReturns, setRecentReturns] = useState<SalesReturnRecord[]>([]);
+  const [isDocSaved, setIsDocSaved] = useState(false);
   const [ownerPin, setOwnerPin] = useState('');
   const [pinError, setPinError] = useState(false);
   const [isPinApproved, setIsPinApproved] = useState(false);
   const [heldBills, setHeldBills] = useState<HeldBill[]>([]);
   const [isSubmittingDoc, setIsSubmittingDoc] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toastIsError, setToastIsError] = useState(false);
+  const submittingRef = useRef(false);
 
   // Refs for keyboard shortcuts
   const searchInputRef = useRef<HTMLInputElement>(null);
   const partySelectRef = useRef<HTMLSelectElement>(null);
 
-  // Bill Summary
-  const summary: BillSummary = api.calculateClientBill(lines, '33', '33', paidAmount);
+  // Place of supply = customer's state (IGST when outside Tamil Nadu); walk-in = shop state
+  const TENANT_STATE_CODE = '33';
+  const placeOfSupply = selectedParty?.state_code || TENANT_STATE_CODE;
 
-  // Credit limit breach check
+  // Bill Summary
+  const summary: BillSummary = api.calculateClientBill(lines, placeOfSupply, TENANT_STATE_CODE, paidAmount);
+
+  // Split payment parts (F8)
+  const splitCash = roundHalfUp(parseFloat(cashPart) || 0);
+  const splitUpi = roundHalfUp(parseFloat(upiPart) || 0);
+  const splitCredit = roundHalfUp(parseFloat(creditPart) || 0);
+
+  // Amount that will go on the customer's credit for the chosen payment mode
+  const creditPortion = paymentMode === 'CREDIT' ? summary.grandTotal : paymentMode === 'SPLIT' ? splitCredit : 0;
+
+  // Credit limit breach check: only the UNPAID part of this bill adds to the party's dues
+  // (a cash/UPI bill never breaches; for CREDIT mode the whole bill is unpaid)
+  const unpaidForLimitCheck = paymentMode === 'CASH' || paymentMode === 'UPI' ? summary.grandTotal : creditPortion;
   const isCreditOverLimit = Boolean(
     billingMode === 'INVOICE' &&
     selectedParty && Number(selectedParty.credit_limit || 0) > 0 && 
-    (Number(selectedParty.current_balance || 0) + summary.grandTotal) > Number(selectedParty.credit_limit || 0)
+    (Number(selectedParty.current_balance || 0) + unpaidForLimitCheck) > Number(selectedParty.credit_limit || 0)
   );
 
   // Show transient toast
-  const showToast = (msg: string) => {
+  const showToast = (msg: string, isError = false) => {
     setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 4500);
+    setToastIsError(isError);
+    setTimeout(() => setToastMessage(null), isError ? 8000 : 4500);
   };
 
   // Keyboard shortcut listener
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // While the receipt preview is open
+      if (showReceiptModal) {
+        if (isDocSaved && (e.key === 'Enter' || e.key === 'F2')) {
+          e.preventDefault();
+          startNewBill();
+          setShowReceiptModal(false);
+          return;
+        }
+        if (e.key === 'F9' || e.key === 'F10') {
+          e.preventDefault();
+          if (isDocSaved) {
+            window.print();
+          } else {
+            handleFinalizeTransaction();
+          }
+          return;
+        }
+      }
       // F2: New Bill
       if (e.key === 'F2') {
         e.preventDefault();
@@ -126,10 +178,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       else if (e.key === 'F8') {
         e.preventDefault();
         if (lines.length > 0 && billingMode === 'INVOICE') {
-          setCashPart((summary.grandTotal / 2).toFixed(2));
-          setUpiPart((summary.grandTotal / 2).toFixed(2));
-          setCreditPart('0.00');
-          setShowSplitModal(true);
+          openSplitModal();
         }
       }
       // F9: Quick Cash Bill & Print
@@ -150,13 +199,14 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
         setShowSplitModal(false);
         setShowPinModal(false);
         setShowQuickCustModal(false);
+        setShowEditCustModal(false);
         setShowDocManagerModal(false);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [lines, selectedParty, summary, paymentMode, isCreditOverLimit, isPinApproved, billingMode]);
+  }, [lines, selectedParty, summary, paymentMode, isCreditOverLimit, isPinApproved, billingMode, showReceiptModal]);
 
   // Load documents when document manager modal opens
   useEffect(() => {
@@ -166,14 +216,20 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
   }, [showDocManagerModal]);
 
   const loadRecentDocuments = async () => {
-    const [qList, cList, rList] = await Promise.all([
-      api.listQuotations(30),
-      api.listDeliveryChallans(30),
-      api.listSalesReturns(30),
-    ]);
-    setRecentQuotes(qList);
-    setRecentChallans(cList);
-    setRecentReturns(rList);
+    try {
+      const [iList, qList, cList, rList] = await Promise.all([
+        api.listInvoices(30),
+        api.listQuotations(30),
+        api.listDeliveryChallans(30),
+        api.listSalesReturns(30),
+      ]);
+      setRecentInvoices(iList);
+      setRecentQuotes(qList);
+      setRecentChallans(cList);
+      setRecentReturns(rList);
+    } catch (e) {
+      console.error('Failed to load recent documents', e);
+    }
   };
 
   // Quick Add Customer Handler
@@ -195,12 +251,61 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
         });
         setSelectedParty(created);
         setIsPinApproved(false);
+        repriceLines(created.price_list_id);
       }
       setShowQuickCustModal(false);
       setQuickCustName('');
       setQuickCustPhone('');
+    } catch (err: any) {
+      showToast(`Customer not saved: ${err?.message || 'server error'}`, true);
     } finally {
       setIsSavingCustomer(false);
+    }
+  };
+
+  // Open Edit Customer Modal
+  const handleOpenEditCustomer = (party: Party) => {
+    setEditCustName(party.name);
+    setEditCustPhone(party.phone || '');
+    setEditCustGstin(party.gstin || '');
+    setEditCustPriceTier((party.price_list_code as any) || 'CONTRACTOR');
+    setEditCustCreditLimit(String(party.credit_limit ?? 0));
+    setEditCustCreditDays(String(party.credit_days ?? 30));
+    setEditCustAddress(party.billing_address || '');
+    setShowEditCustModal(true);
+  };
+
+  // Save Edit Customer Handler
+  const handleSaveEditCustomer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedParty || !editCustName.trim()) return;
+    try {
+      setIsUpdatingCustomer(true);
+      const updateData: PartyUpdateInput = {
+        name: editCustName.trim(),
+        phone: editCustPhone.trim() || undefined,
+        gstin: editCustGstin.trim() || undefined,
+        price_list_code: editCustPriceTier,
+        credit_limit: parseFloat(editCustCreditLimit) || 0,
+        credit_days: parseInt(editCustCreditDays, 10) || 0,
+        billing_address: editCustAddress.trim() || undefined,
+      };
+
+      let updated: Party;
+      if (onUpdateParty) {
+        updated = await onUpdateParty(selectedParty.id, updateData);
+      } else {
+        updated = await api.updateParty(selectedParty.id, updateData);
+      }
+
+      setSelectedParty(updated);
+      repriceLines(updated.price_list_id);
+      setShowEditCustModal(false);
+      showToast(language === 'ta' ? 'வாடிக்கையாளர் விவரங்கள் மாற்றப்பட்டன!' : 'Customer details updated successfully!');
+    } catch (err: any) {
+      showToast(`Customer not updated: ${err?.message || 'server error'}`, true);
+    } finally {
+      setIsUpdatingCustomer(false);
     }
   };
 
@@ -234,50 +339,80 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       setSelectedSearchIdx(prev => (prev - 1 + searchResults.length) % searchResults.length);
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      // First check if backend search finds exact barcode
       const cleanQ = searchQuery.trim();
       if (!cleanQ) return;
+      // Respect the row picked with Arrow keys; clear the omnibar at once so the next
+      // barcode scan is not merged with / wiped by this async lookup.
+      const localChoice = showSearchResults ? (searchResults[selectedSearchIdx] || searchResults[0]) : undefined;
+      setSearchQuery('');
+      setShowSearchResults(false);
 
-      try {
-        const backendMatch = await api.searchBillingProducts(cleanQ);
-        if (backendMatch.length > 0) {
-          const item = backendMatch[0];
-          // Find matching product in catalog or construct
-          const matchedProd = products.find(p => p.id === item.id) || {
-            id: item.id,
-            code: item.code,
-            name: item.name,
-            tamil_name: item.tamil_name,
-            hsn_code: item.hsn_code,
-            base_unit: item.base_unit,
-            is_variable_weight: item.is_variable_weight,
-            min_stock_base: 0,
-            purchase_price_base: item.cost_price_base,
-            units: item.units.map(u => ({
-              unit_name: u.unit_name,
-              conversion_factor: u.conversion_factor,
-              can_buy: true,
-              can_sell: u.can_sell,
-              barcode: u.barcode,
-              is_default_sales_unit: u.is_default_sales_unit,
-            }))
-          };
-          addProductToBill(matchedProd, item.matched_unit);
-          return;
-        }
-      } catch {
-        // Fallback to local search results
-      }
+      const priceListId = selectedParty?.price_list_id;
+      let item = await fetchSearchItem(cleanQ, localChoice?.id, priceListId);
+      if (!item && localChoice) item = await fetchSearchItem(localChoice.code, localChoice.id, priceListId);
 
-      const chosen = searchResults[selectedSearchIdx] || searchResults[0];
-      if (chosen) {
-        addProductToBill(chosen);
+      if (item) {
+        const found = item;
+        const matchedProd = products.find(p => p.id === found.id) || productFromSearchItem(found);
+        addProductToBill(matchedProd, found.matched_unit, found);
+      } else if (localChoice) {
+        addProductToBill(localChoice);
+      } else {
+        showToast(`No item found for "${cleanQ}"`, true);
       }
     }
   };
 
+  // Server-side search returns customer price-list selling prices per unit + GST rate
+  const fetchSearchItem = async (query: string, productId: string | undefined, priceListId: string | undefined): Promise<ProductSearchItem | undefined> => {
+    const results = await api.searchBillingProducts(query, undefined, priceListId);
+    return productId ? results.find(r => r.id === productId) : results[0];
+  };
+
+  const productFromSearchItem = (item: ProductSearchItem): Product => ({
+    id: item.id,
+    code: item.code,
+    name: item.name,
+    tamil_name: item.tamil_name,
+    hsn_code: item.hsn_code,
+    base_unit: item.base_unit,
+    is_variable_weight: item.is_variable_weight,
+    min_stock_base: 0,
+    purchase_price_base: item.cost_price_base,
+    units: item.units.map(u => ({
+      unit_name: u.unit_name,
+      conversion_factor: u.conversion_factor,
+      can_buy: true,
+      can_sell: u.can_sell,
+      barcode: u.barcode,
+      is_default_sales_unit: u.is_default_sales_unit,
+    })),
+  });
+
+  // Click / quick-item add: look up tier price first, fall back to local estimate offline
+  const addProductWithPricing = async (prod: Product) => {
+    setSearchQuery('');
+    setShowSearchResults(false);
+    const item = await fetchSearchItem(prod.code, prod.id, selectedParty?.price_list_id);
+    addProductToBill(prod, undefined, item);
+  };
+
+  // Re-apply the selected customer's price list (Retail / Contractor / Wholesale) to lines already on the bill
+  const repriceLines = async (priceListId: string | undefined) => {
+    if (lines.length === 0) return;
+    const uniqueProducts = Array.from(new Map(lines.map(l => [l.productId, l.productCode])).entries());
+    const items = await Promise.all(uniqueProducts.map(([id, code]) => fetchSearchItem(code, id, priceListId)));
+    const byId = new Map(items.filter((i): i is ProductSearchItem => Boolean(i)).map(i => [i.id, i]));
+    setLines(prev => prev.map(l => {
+      const item = byId.get(l.productId);
+      if (!item) return l;
+      const unitPrices = Object.fromEntries(item.units.map(u => [u.unit_name, u.selling_price]));
+      return { ...l, unitPrices, unitPrice: unitPrices[l.unitName] ?? l.unitPrice, gstRatePercent: item.gst_rate_percent };
+    }));
+  };
+
   // Add Product to bill with smart packaging unit auto-selection
-  const addProductToBill = (prod: Product, targetUnitName?: string) => {
+  const addProductToBill = (prod: Product, targetUnitName?: string, priced?: ProductSearchItem) => {
     let chosenUnit: ProductUnit;
     if (targetUnitName) {
       chosenUnit = prod.units.find(u => u.unit_name.toLowerCase() === targetUnitName.toLowerCase()) || prod.units[0];
@@ -290,8 +425,14 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       };
     }
 
+    const unitPrices = priced
+      ? Object.fromEntries(priced.units.map(u => [u.unit_name, u.selling_price]))
+      : undefined;
+
     let unitPrice = 0;
-    if (prod.code === 'SCR001') unitPrice = chosenUnit.unit_name === 'Box' ? 185.00 : 1.85;
+    if (unitPrices && unitPrices[chosenUnit.unit_name] !== undefined) unitPrice = unitPrices[chosenUnit.unit_name];
+    // Offline estimates only (no server price list reachable)
+    else if (prod.code === 'SCR001') unitPrice = chosenUnit.unit_name === 'Box' ? 185.00 : 1.85;
     else if (prod.code === 'TMT012') unitPrice = chosenUnit.unit_name === 'Rod' ? 650.00 : 61.00;
     else if (prod.code === 'PNT001') unitPrice = 275.00;
     else if (prod.code === 'PIP001') unitPrice = 85.00;
@@ -309,22 +450,32 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       conversionFactor: chosenUnit.conversion_factor,
       quantity: 1,
       isVariableWeight: prod.is_variable_weight,
-      actualWeightKg: prod.is_variable_weight ? 10.65 : undefined,
+      actualWeightKg: undefined, // scale weight is entered by the clerk; until then base = qty x factor
       baseQuantity: chosenUnit.conversion_factor,
       unitPrice,
       discountType: 'FLAT',
       discountValue: 0,
       discountAmount: 0,
       taxableAmount: unitPrice,
-      gstRatePercent: 18,
+      gstRatePercent: priced ? priced.gst_rate_percent : 18,
       cgstAmount: 0,
       sgstAmount: 0,
       igstAmount: 0,
       lineTotal: unitPrice,
       availableUnits: prod.units.length > 0 ? prod.units : [chosenUnit],
+      unitPrices,
+      returnCondition: 'EXCESS',
     };
 
-    setLines(prev => [...prev, newLine]);
+    // Same item & unit already on the bill (e.g. scanned twice): increase quantity instead of a duplicate line.
+    // Done inside the updater so back-to-back scans (async price lookups) see the latest lines.
+    setLines(prev => {
+      const existing = prev.find(l => l.productId === prod.id && l.unitName === chosenUnit.unit_name && !l.isVariableWeight);
+      if (!existing) return [...prev, newLine];
+      return prev.map(l => l.id === existing.id
+        ? { ...l, quantity: l.quantity + 1, baseQuantity: (l.quantity + 1) * l.conversionFactor }
+        : l);
+    });
     setSearchQuery('');
     setShowSearchResults(false);
   };
@@ -336,18 +487,16 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       const foundUnit = line.availableUnits.find(u => u.unit_name === unitName);
       if (!foundUnit) return line;
 
-      let adjustedPrice = line.unitPrice;
-      if (foundUnit.conversion_factor === 1 && line.conversionFactor > 1) {
-        adjustedPrice = Math.round((line.unitPrice / line.conversionFactor) * 100) / 100;
-      } else if (foundUnit.conversion_factor > 1 && line.conversionFactor === 1) {
-        adjustedPrice = Math.round((line.unitPrice * foundUnit.conversion_factor) * 100) / 100;
-      }
+      // Price-list price for the new unit; otherwise scale by conversion factors (works for Box<->Case too)
+      const adjustedPrice = line.unitPrices?.[foundUnit.unit_name]
+        ?? roundHalfUp((line.unitPrice / line.conversionFactor) * foundUnit.conversion_factor);
 
       return {
         ...line,
         unitName: foundUnit.unit_name,
         conversionFactor: foundUnit.conversion_factor,
         unitPrice: adjustedPrice,
+        actualWeightKg: undefined,
         baseQuantity: line.quantity * foundUnit.conversion_factor,
       };
     }));
@@ -361,6 +510,8 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       return {
         ...line,
         quantity: safeQty,
+        // A previously entered scale weight belongs to the old quantity: re-weigh
+        actualWeightKg: undefined,
         baseQuantity: safeQty * line.conversionFactor,
       };
     }));
@@ -370,10 +521,11 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
   const handleScaleWeightChange = (lineId: string, weightKg: number) => {
     setLines(prev => prev.map(line => {
       if (line.id !== lineId) return line;
+      const weight = weightKg > 0 ? weightKg : undefined;
       return {
         ...line,
-        actualWeightKg: Math.max(0.01, weightKg),
-        baseQuantity: Math.max(0.01, weightKg),
+        actualWeightKg: weight,
+        baseQuantity: weight ?? line.quantity * line.conversionFactor,
       };
     }));
   };
@@ -407,6 +559,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     setPaymentMode('CASH');
     setPaidAmount(undefined);
     setIsPinApproved(false);
+    setIsDocSaved(false);
     const prefix = billingMode === 'INVOICE' ? 'C1/26-27/' :
                    billingMode === 'RETURN' ? 'RET/26-27/' :
                    billingMode === 'QUOTATION' ? 'QT/26-27/' : 'DC/26-27/';
@@ -417,6 +570,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
   // Switch Mode
   const handleModeChange = (mode: BillingMode) => {
     setBillingMode(mode);
+    setIsDocSaved(false);
     const prefix = mode === 'INVOICE' ? 'C1/26-27/' :
                    mode === 'RETURN' ? 'RET/26-27/' :
                    mode === 'QUOTATION' ? 'QT/26-27/' : 'DC/26-27/';
@@ -431,6 +585,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       id: Math.random().toString(36).substring(7),
       heldAt: new Date().toLocaleTimeString(),
       partyName: selectedParty ? selectedParty.name : 'Walk-in Customer',
+      partyId: selectedParty?.id,
       lines: [...lines],
       grandTotal: summary.grandTotal,
     };
@@ -442,6 +597,8 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
   // Recall held bill
   const recallBill = (held: HeldBill) => {
     setLines(held.lines);
+    setSelectedParty(held.partyId ? parties.find(p => p.id === held.partyId) || null : null);
+    setIsPinApproved(false);
     setHeldBills(prev => prev.filter(h => h.id !== held.id));
     setShowHoldModal(false);
   };
@@ -449,7 +606,18 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
   // Checkout with credit check protection
   const attemptCheckout = (mode: 'CASH' | 'UPI' | 'CREDIT' | 'SPLIT') => {
     if (lines.length === 0) return;
+    if (billingMode === 'INVOICE' && mode === 'SPLIT') {
+      openSplitModal();
+      return;
+    }
     setPaymentMode(mode);
+
+    // Udhar needs a party ledger to post the due to
+    if (billingMode === 'INVOICE' && mode === 'CREDIT' && !selectedParty) {
+      showToast('Select a customer (F4) for a credit bill', true);
+      partySelectRef.current?.focus();
+      return;
+    }
 
     // If credit mode or customer exceeds limit without override PIN
     if (billingMode === 'INVOICE' && mode === 'CREDIT' && isCreditOverLimit && !isPinApproved) {
@@ -457,6 +625,36 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       return;
     }
 
+    setIsDocSaved(false);
+    setShowReceiptModal(true);
+  };
+
+  const openSplitModal = () => {
+    const half = roundHalfUp(summary.grandTotal / 2);
+    setCashPart(half.toFixed(2));
+    setUpiPart(roundHalfUp(summary.grandTotal - half).toFixed(2));
+    setCreditPart('0.00');
+    setShowSplitModal(true);
+  };
+
+  const confirmSplit = () => {
+    const total = roundHalfUp(splitCash + splitUpi + splitCredit);
+    if (Math.abs(total - summary.grandTotal) > 0.001) {
+      showToast(`Split parts total ₹${total.toFixed(2)} must equal bill ₹${summary.grandTotal.toFixed(2)}`, true);
+      return;
+    }
+    if (splitCredit > 0 && !selectedParty) {
+      showToast('Select a customer (F4) to put part of the bill on credit', true);
+      return;
+    }
+    setPaymentMode('SPLIT');
+    setShowSplitModal(false);
+    const overLimit = Boolean(selectedParty && Number(selectedParty.credit_limit || 0) > 0 &&
+      Number(selectedParty.current_balance || 0) + splitCredit > Number(selectedParty.credit_limit || 0));
+    if (splitCredit > 0 && overLimit && !isPinApproved) {
+      setShowPinModal(true);
+      return;
+    }
     setShowReceiptModal(true);
   };
 
@@ -476,6 +674,8 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
 
   // Finalize transaction with Server API
   const handleFinalizeTransaction = async () => {
+    if (submittingRef.current || lines.length === 0) return; // guard double F9 / Enter
+    submittingRef.current = true;
     try {
       setIsSubmittingDoc(true);
 
@@ -485,8 +685,17 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
           customer_name: selectedParty?.name || 'Walk-in Retail',
           customer_phone: selectedParty?.phone,
           customer_gstin: selectedParty?.gstin,
+          place_of_supply_state_code: placeOfSupply,
+          is_b2b: Boolean(selectedParty?.gstin),
+          price_list_id: selectedParty?.price_list_id,
           payment_mode: paymentMode,
-          paid_amount: paidAmount !== undefined ? paidAmount : (paymentMode === 'CREDIT' ? 0 : summary.grandTotal),
+          // Cash-drawer reconciliation reads CASH / UPI parts; the credit part is the invoice due
+          payment_breakdown: paymentMode === 'SPLIT'
+            ? { CASH: splitCash, UPI: splitUpi }
+            : undefined,
+          // Server rejects credit-limit / floor-price breaches unless the owner PIN was approved
+          owner_override: isPinApproved,
+          paid_amount: paidAmount !== undefined ? paidAmount : roundHalfUp(summary.grandTotal - creditPortion),
           lines: lines.map(l => ({
             product_id: l.productId,
             unit_name: l.unitName,
@@ -501,7 +710,9 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
           })),
         };
         const inv = await api.createInvoice(payload);
-        showToast(`Tax Invoice ${inv.invoice_number} saved & stock decremented!`);
+        setInvoiceNumber(inv.invoice_number);
+        const flags = inv.review_flags && inv.review_flags.length > 0 ? ` Flagged for owner review: ${inv.review_flags.join(', ')}` : '';
+        showToast(`Tax Invoice ${inv.invoice_number} saved & stock decremented!${flags}`);
       } else if (billingMode === 'RETURN') {
         const payload = {
           party_id: selectedParty?.id,
@@ -515,15 +726,24 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
             quantity: l.quantity,
             unit_price: l.unitPrice,
             gst_rate_percent: l.gstRatePercent,
+            return_condition: l.returnCondition || 'EXCESS',
           })),
         };
         const ret = await api.createSalesReturn(payload);
-        showToast(`Sales Return ${ret.return_number} recorded & stock restored!`);
+        setInvoiceNumber(ret.return_number);
+        const hasDamaged = ret.lines?.some((l: any) => l.return_condition === 'DAMAGED');
+        showToast(
+          hasDamaged
+            ? `Sales Return ${ret.return_number} recorded (Damaged items blocked from stock)!`
+            : `Sales Return ${ret.return_number} recorded & sellable stock restored!`
+        );
       } else if (billingMode === 'QUOTATION') {
         const payload = {
           party_id: selectedParty?.id,
           customer_name: selectedParty?.name || 'Contractor / Customer',
           customer_phone: selectedParty?.phone,
+          place_of_supply_state_code: placeOfSupply,
+          price_list_id: selectedParty?.price_list_id,
           notes: quotationNotes,
           lines: lines.map(l => ({
             product_id: l.productId,
@@ -536,6 +756,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
           })),
         };
         const qt = await api.createQuotation(payload);
+        setInvoiceNumber(qt.quotation_number);
         showToast(`Quotation ${qt.quotation_number} generated!`);
       } else if (billingMode === 'CHALLAN') {
         const payload = {
@@ -553,20 +774,68 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
           })),
         };
         const dc = await api.createDeliveryChallan(payload);
+        setInvoiceNumber(dc.challan_number);
         showToast(`Delivery Challan ${dc.challan_number} dispatched & stock moved!`);
       }
 
-      window.print();
-      startNewBill();
-      setShowReceiptModal(false);
+      onDocumentSaved?.();
+      setIsDocSaved(true);
+      setTimeout(() => {
+        window.print();
+      }, 150);
     } catch (err: any) {
-      showToast(`Note: ${err.message || 'Saved locally in SQLite counter sync queue'}`);
-      window.print();
-      startNewBill();
-      setShowReceiptModal(false);
+      // Server demands owner approval (floor price / credit limit): ask for the PIN, then resend with owner_override
+      if (billingMode === 'INVOICE' && !isPinApproved && String(err?.message || '').includes('Owner override required')) {
+        setShowReceiptModal(false);
+        setShowPinModal(true);
+        showToast(`${err.message}`, true);
+        return;
+      }
+      // Not saved: keep the bill on screen so the clerk can retry (never print an unposted bill)
+      showToast(`NOT SAVED - ${err?.message || 'server unreachable'}. Bill kept on screen, retry with F9.`, true);
     } finally {
+      submittingRef.current = false;
       setIsSubmittingDoc(false);
     }
+  };
+
+  // View & Reprint an existing Sales Invoice
+  const handleReprintInvoice = (inv: SalesInvoiceRecord) => {
+    setInvoiceNumber(inv.invoice_number);
+    setBillingMode('INVOICE');
+    setSelectedParty(parties.find(p => p.id === inv.party_id) || null);
+    if (inv.lines && inv.lines.length > 0) {
+      setLines(inv.lines.map((l: any, i: number) => {
+        const prod = products.find(p => p.id === l.product_id);
+        return {
+          id: l.id || `line-${i}`,
+          productId: l.product_id,
+          productCode: prod?.code || '',
+          name: prod?.name || l.unit_name || 'Item',
+          tamilName: prod?.tamil_name,
+          hsnCode: l.hsn_code || prod?.hsn_code || '',
+          unitName: l.unit_name,
+          conversionFactor: Number(l.conversion_factor) || 1,
+          quantity: Number(l.quantity),
+          isVariableWeight: false,
+          baseQuantity: Number(l.base_quantity) || Number(l.quantity),
+          unitPrice: Number(l.unit_price),
+          discountType: 'FLAT',
+          discountValue: 0,
+          discountAmount: Number(l.discount_amount) || 0,
+          taxableAmount: Number(l.taxable_amount),
+          gstRatePercent: Number(l.gst_rate_percent),
+          cgstAmount: Number(l.cgst_amount) || 0,
+          sgstAmount: Number(l.sgst_amount) || 0,
+          igstAmount: Number(l.igst_amount) || 0,
+          lineTotal: Number(l.line_total),
+          availableUnits: prod?.units || [],
+        };
+      }));
+    }
+    setIsDocSaved(true);
+    setShowDocManagerModal(false);
+    setShowReceiptModal(true);
   };
 
   // Convert Quotation to Invoice
@@ -575,6 +844,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       const inv = await api.convertQuotationToInvoice(q.id, 'CASH');
       showToast(`Quotation ${q.quotation_number} converted to Tax Invoice ${inv.invoice_number}!`);
       loadRecentDocuments();
+      onDocumentSaved?.();
     } catch (err: any) {
       alert(`Error converting quotation: ${err.message}`);
     }
@@ -586,6 +856,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
       const inv = await api.convertChallanToInvoice(dc.id, 'CREDIT');
       showToast(`Challan ${dc.challan_number} converted to Invoice ${inv.invoice_number} (no duplicate stock deduction)!`);
       loadRecentDocuments();
+      onDocumentSaved?.();
     } catch (err: any) {
       alert(`Error converting challan: ${err.message}`);
     }
@@ -598,8 +869,10 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
     <div className="max-w-7xl mx-auto px-4 py-3 space-y-3">
       {/* Toast Alert */}
       {toastMessage && (
-        <div className="fixed top-16 right-6 z-50 bg-emerald-600 text-white px-4 py-2.5 rounded-xl shadow-2xl flex items-center gap-2 border border-emerald-400 font-semibold text-xs animate-bounce">
-          <CheckCircle2 className="w-4 h-4" />
+        <div className={`fixed top-16 right-6 z-[60] text-white px-4 py-2.5 rounded-xl shadow-2xl flex items-center gap-2 border font-semibold text-xs ${
+          toastIsError ? 'bg-red-700 border-red-400' : 'bg-emerald-600 border-emerald-400 animate-bounce'
+        }`}>
+          {toastIsError ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
           <span>{toastMessage}</span>
         </div>
       )}
@@ -662,7 +935,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
         >
           <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
-          <span>{language === 'ta' ? 'ஆவண மேலாளர் (Quotes/DC)' : 'Quotes & Challans Tray'}</span>
+          <span>{language === 'ta' ? 'பில்கள் & ஆவணங்கள் (Bills/Quotes/DC)' : 'Bills & Documents Tray'}</span>
         </button>
       </div>
 
@@ -683,6 +956,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 const party = parties.find(p => p.id === e.target.value) || null;
                 setSelectedParty(party);
                 setIsPinApproved(false);
+                repriceLines(party?.price_list_id);
               }}
             >
               <option value="">Walk-in Retail (சில்லறை விற்பனை)</option>
@@ -701,6 +975,17 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
               <UserPlus className="w-3.5 h-3.5" />
               <span>{language === 'ta' ? '+ புதியவர்' : '+ Add'}</span>
             </button>
+            {selectedParty && (
+              <button
+                type="button"
+                onClick={() => handleOpenEditCustomer(selectedParty)}
+                title={language === 'ta' ? 'வாடிக்கையாளர் விவரங்களை மாற்று' : 'Edit Customer Details'}
+                className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold flex items-center gap-1 transition shadow-sm whitespace-nowrap"
+              >
+                <Pencil className="w-3.5 h-3.5" />
+                <span>{language === 'ta' ? 'மாற்று' : 'Edit'}</span>
+              </button>
+            )}
           </div>
         </div>
 
@@ -853,7 +1138,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 {searchResults.map((prod, idx) => (
                   <div
                     key={prod.id}
-                    onClick={() => addProductToBill(prod)}
+                    onClick={() => addProductWithPricing(prod)}
                     className={`flex items-center justify-between p-3 cursor-pointer border-b border-slate-700/50 text-xs transition ${
                       idx === selectedSearchIdx ? 'bg-emerald-950/60 border-l-4 border-l-emerald-400' : 'hover:bg-slate-700/60'
                     }`}
@@ -864,7 +1149,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                         {prod.tamil_name && <span className="text-emerald-400 text-xs">({prod.tamil_name})</span>}
                       </div>
                       <div className="text-slate-400 text-[11px] font-mono mt-0.5">
-                        Code: {prod.code} • Base: {prod.base_unit} • HSN: {prod.hsn_code}
+                        Code: {prod.code} • Base: {prod.base_unit} • HSN: {prod.hsn_code} • GST: {prod.gst_rate_percent ?? 18}%
                         {prod.display_stock && <span className="ml-2 text-amber-300">Stock: {prod.display_stock}</span>}
                       </div>
                     </div>
@@ -887,6 +1172,9 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                   <tr>
                     <th className="p-2.5 w-10">#</th>
                     <th className="p-2.5">Item Name & Tamil Label</th>
+                    {billingMode === 'RETURN' && (
+                      <th className="p-2.5 w-40 text-center text-rose-300">Condition (பொருள் நிலை)</th>
+                    )}
                     <th className="p-2.5 w-24 text-center">Unit</th>
                     <th className="p-2.5 w-24 text-center">Qty</th>
                     <th className="p-2.5 w-24 text-right">Rate (₹)</th>
@@ -898,7 +1186,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 <tbody className="divide-y divide-slate-700/60 font-sans">
                   {lines.length === 0 ? (
                     <tr>
-                      <td colSpan={8} className="p-16 text-center text-slate-400 text-sm">
+                      <td colSpan={billingMode === 'RETURN' ? 9 : 8} className="p-16 text-center text-slate-400 text-sm">
                         <div className="flex flex-col items-center justify-center gap-2">
                           <Barcode className="w-8 h-8 text-slate-600" />
                           <span>Bill is currently empty. Press <KbdBadge>F3</KbdBadge> to scan barcode or search items.</span>
@@ -910,7 +1198,12 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                       <tr key={line.id} className="hover:bg-slate-700/30 transition">
                         <td className="p-2.5 text-slate-400 font-mono">{idx + 1}</td>
                         <td className="p-2.5">
-                          <div className="font-bold text-slate-100">{line.name}</div>
+                          <div className="font-bold text-slate-100 flex items-center gap-2">
+                            <span>{line.name}</span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono font-medium border border-slate-700/60">
+                              GST {line.gstRatePercent}%
+                            </span>
+                          </div>
                           {line.tamilName && <div className="text-slate-400 text-[11px]">{line.tamilName}</div>}
                           {line.isVariableWeight && (
                             <div className="flex items-center gap-1.5 mt-1">
@@ -919,13 +1212,33 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                                 type="number"
                                 step="any"
                                 className="w-20 bg-slate-900 border border-amber-600 text-amber-300 px-1 py-0.5 rounded text-[11px] font-mono font-bold"
-                                value={line.actualWeightKg || ''}
+                                value={line.actualWeightKg ?? ''}
+                                placeholder={String(roundHalfUp(line.quantity * line.conversionFactor, 3))}
                                 onChange={(e) => handleScaleWeightChange(line.id, parseFloat(e.target.value) || 0)}
                               />
                               <span className="text-[10px] text-amber-400 font-mono">kg</span>
                             </div>
                           )}
                         </td>
+                        {billingMode === 'RETURN' && (
+                          <td className="p-2.5 text-center">
+                            <select
+                              value={line.returnCondition || 'EXCESS'}
+                              onChange={(e) => {
+                                const cond = e.target.value as 'EXCESS' | 'DAMAGED';
+                                setLines(lines.map(l => l.id === line.id ? { ...l, returnCondition: cond } : l));
+                              }}
+                              className={`rounded-lg px-2 py-1 text-xs font-bold border transition ${
+                                line.returnCondition === 'DAMAGED'
+                                  ? 'bg-rose-950 text-rose-300 border-rose-700'
+                                  : 'bg-emerald-950 text-emerald-300 border-emerald-700'
+                              }`}
+                            >
+                              <option value="EXCESS">✅ Excess (Restock)</option>
+                              <option value="DAMAGED">❌ Damaged (No Restock)</option>
+                            </select>
+                          </td>
+                        )}
                         {/* Unit Picker with Smart Conversion */}
                         <td className="p-2.5 text-center">
                           <select
@@ -948,7 +1261,8 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                             step="any"
                             className="w-18 bg-slate-900 border border-slate-700 text-white text-center rounded-lg px-2 py-1 text-xs font-mono font-bold focus:border-emerald-500"
                             value={line.quantity}
-                            onChange={(e) => handleQuantityChange(line.id, parseFloat(e.target.value) || 0)}
+                            onFocus={(e) => e.target.select()}
+                            onChange={(e) => handleQuantityChange(line.id, parseFloat(e.target.value.replace(/^0+(?=\d)/, '')) || 0)}
                           />
                         </td>
                         {/* Rate Input */}
@@ -958,7 +1272,8 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                             step="any"
                             className="w-20 bg-slate-900 border border-slate-700 text-white text-right rounded-lg px-2 py-1 text-xs font-mono font-bold focus:border-emerald-500"
                             value={line.unitPrice}
-                            onChange={(e) => handlePriceChange(line.id, parseFloat(e.target.value) || 0)}
+                            onFocus={(e) => e.target.select()}
+                            onChange={(e) => handlePriceChange(line.id, parseFloat(e.target.value.replace(/^0+(?=\d)/, '')) || 0)}
                           />
                         </td>
                         {/* Discount Input */}
@@ -968,7 +1283,8 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                             step="any"
                             className="w-16 bg-slate-900 border border-slate-700 text-amber-300 text-right rounded-lg px-1.5 py-1 text-xs font-mono focus:border-emerald-500"
                             value={line.discountValue}
-                            onChange={(e) => handleDiscountChange(line.id, parseFloat(e.target.value) || 0)}
+                            onFocus={(e) => e.target.select()}
+                            onChange={(e) => handleDiscountChange(line.id, parseFloat(e.target.value.replace(/^0+(?=\d)/, '')) || 0)}
                           />
                         </td>
                         {/* Line Total */}
@@ -999,7 +1315,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 {products.slice(0, 4).map(p => (
                   <button
                     key={p.id}
-                    onClick={() => addProductToBill(p)}
+                    onClick={() => addProductWithPricing(p)}
                     className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] font-medium transition"
                   >
                     + {p.name.split(' ')[0]}
@@ -1021,7 +1337,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                  billingMode === 'QUOTATION' ? 'Quotation Summary' : 'Dispatch Summary'}
               </span>
               <span className="text-[11px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-mono font-medium">
-                TN GST (CGST+SGST 18%)
+                {summary.isInterState ? `IGST (POS ${placeOfSupply})` : 'GST'}
               </span>
             </div>
 
@@ -1032,12 +1348,8 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 <CurrencyCell amount={summary.subtotalTaxable} />
               </div>
               <div className="flex justify-between text-slate-400">
-                <span>CGST (9%):</span>
-                <CurrencyCell amount={summary.cgstTotal} />
-              </div>
-              <div className="flex justify-between text-slate-400">
-                <span>SGST (9%):</span>
-                <CurrencyCell amount={summary.sgstTotal} />
+                <span>{summary.isInterState ? 'IGST:' : 'GST:'}</span>
+                <CurrencyCell amount={summary.taxTotal} />
               </div>
               {summary.totalDiscount > 0 && (
                 <div className="flex justify-between text-amber-400 font-semibold">
@@ -1085,10 +1397,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                       key={mode}
                       onClick={() => {
                         if (mode === 'SPLIT') {
-                          setCashPart((summary.grandTotal / 2).toFixed(2));
-                          setUpiPart((summary.grandTotal / 2).toFixed(2));
-                          setCreditPart('0.00');
-                          setShowSplitModal(true);
+                          openSplitModal();
                         } else {
                           setPaymentMode(mode);
                         }
@@ -1165,8 +1474,11 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
           <span><KbdBadge>F9</KbdBadge> Quick Print</span>
           <span><KbdBadge>F10</KbdBadge> Settle</span>
         </div>
-        <div className="text-[11px] font-mono text-emerald-400 font-bold">
-          Zero-Training 30s Counter POS ⚡
+        <div className="text-[11px] font-mono text-emerald-400 font-bold flex items-center gap-2">
+          {Boolean(pendingSyncCount && pendingSyncCount > 0) && (
+            <span className="text-amber-400 font-normal">({pendingSyncCount} queued)</span>
+          )}
+          <span>Zero-Training 30s Counter POS ⚡</span>
         </div>
       </footer>
 
@@ -1189,7 +1501,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
             </div>
 
             {/* Thermal Slip Simulation */}
-            <div className="bg-white text-black p-4 rounded-lg font-mono text-xs shadow-inner space-y-2 select-text max-h-96 overflow-y-auto">
+            <div id="thermal-receipt-printable" className="bg-white text-black p-4 rounded-lg font-mono text-xs shadow-inner space-y-2 select-text max-h-96 overflow-y-auto">
               <div className="text-center font-bold text-sm">SALEM SRI MURUGAN HARDWARE</div>
               <div className="text-center text-[10px]">ஸ்ரீ முருகன் ஹார்ட்வேர்</div>
               <div className="text-center text-[10px]">142 Junction Main Road, Salem - 636004</div>
@@ -1215,7 +1527,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                   <div key={l.id} className="flex justify-between text-[11px]">
                     <div className="truncate w-36">
                       <div>{l.name}</div>
-                      <div className="text-[9px] text-gray-600">{l.quantity} {l.unitName} @ ₹{l.unitPrice}</div>
+                      <div className="text-[9px] text-gray-600">{l.quantity} {l.unitName} @ ₹{l.unitPrice} (GST {l.gstRatePercent}%)</div>
                     </div>
                     <div className="font-bold">₹{l.lineTotal.toFixed(2)}</div>
                   </div>
@@ -1228,17 +1540,13 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 <span>₹{summary.subtotalTaxable.toFixed(2)}</span>
               </div>
               <div className="flex justify-between">
-                <span>CGST (9%):</span>
-                <span>₹{summary.cgstTotal.toFixed(2)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>SGST (9%):</span>
-                <span>₹{summary.sgstTotal.toFixed(2)}</span>
+                <span>{summary.isInterState ? 'IGST:' : 'GST:'}</span>
+                <span>₹{summary.taxTotal.toFixed(2)}</span>
               </div>
               {summary.roundOff !== 0 && (
                 <div className="flex justify-between">
                   <span>Round-off:</span>
-                  <span>{summary.roundOff.toFixed(2)}</span>
+                  <span>₹{summary.roundOff.toFixed(2)}</span>
                 </div>
               )}
               <div className="border-b-2 border-black my-1"></div>
@@ -1264,14 +1572,38 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
 
             {/* Modal Actions */}
             <div className="flex items-center gap-3">
-              <button
-                onClick={handleFinalizeTransaction}
-                disabled={isSubmittingDoc}
-                className="flex-1 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white py-2.5 rounded-xl font-bold text-xs shadow-md transition"
-              >
-                <Printer className="w-4 h-4" />
-                <span>{isSubmittingDoc ? 'Posting to DB...' : 'Save & Print Slip'}</span>
-              </button>
+              {isDocSaved ? (
+                <>
+                  <button
+                    onClick={() => window.print()}
+                    className="flex-1 flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 text-white py-2.5 rounded-xl font-bold text-xs transition"
+                  >
+                    <Printer className="w-4 h-4 text-emerald-400" />
+                    <span>Print Bill Slip Again</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      startNewBill();
+                      setShowReceiptModal(false);
+                    }}
+                    autoFocus
+                    className="flex-1 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white py-2.5 rounded-xl font-bold text-xs shadow-md transition"
+                  >
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Done / + New Bill [Enter]</span>
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={handleFinalizeTransaction}
+                  disabled={isSubmittingDoc}
+                  autoFocus
+                  className="flex-1 flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white py-2.5 rounded-xl font-bold text-xs shadow-md transition"
+                >
+                  <Printer className="w-4 h-4" />
+                  <span>{isSubmittingDoc ? 'Posting to DB...' : 'Save & Print Slip [Enter / F9]'}</span>
+                </button>
+              )}
 
               {selectedParty?.phone && (
                 <a
@@ -1297,7 +1629,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2">
                 <FolderOpen className="w-5 h-5 text-amber-400" />
-                <h3 className="font-bold text-white text-base">Quotations & Delivery Challans Manager</h3>
+                <h3 className="font-bold text-white text-base">Bills, Quotations & Challans Manager</h3>
               </div>
               <button onClick={() => setShowDocManagerModal(false)} className="text-slate-400 hover:text-white">
                 <X className="w-5 h-5" />
@@ -1306,6 +1638,15 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
 
             {/* Sub-tabs */}
             <div className="flex gap-2 border-b border-slate-800 pb-2 text-xs">
+              <button
+                onClick={() => setDocManagerTab('INVOICES')}
+                className={`px-3 py-1.5 rounded-lg font-bold transition flex items-center gap-1.5 ${
+                  docManagerTab === 'INVOICES' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:bg-slate-800'
+                }`}
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>Invoices / Bills ({recentInvoices.length})</span>
+              </button>
               <button
                 onClick={() => setDocManagerTab('QUOTES')}
                 className={`px-3 py-1.5 rounded-lg font-bold transition ${
@@ -1334,6 +1675,46 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
 
             {/* Tab Contents */}
             <div className="flex-1 overflow-y-auto space-y-2 text-xs">
+              {docManagerTab === 'INVOICES' && (
+                recentInvoices.length === 0 ? (
+                  <div className="text-center p-8 text-slate-500">No recent bills found. New bills saved will appear here.</div>
+                ) : (
+                  recentInvoices.map(inv => (
+                    <div key={inv.id} className="p-3 rounded-xl bg-slate-800/80 border border-slate-700 flex items-center justify-between hover:border-slate-600 transition">
+                      <div>
+                        <div className="font-bold text-white flex items-center gap-2">
+                          <span className="font-mono text-emerald-400">{inv.invoice_number}</span>
+                          <span className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold ${
+                            inv.payment_mode === 'CASH' ? 'bg-emerald-950 text-emerald-400 border border-emerald-700' :
+                            inv.payment_mode === 'UPI' ? 'bg-sky-950 text-sky-400 border border-sky-700' :
+                            inv.payment_mode === 'CREDIT' ? 'bg-amber-950 text-amber-400 border border-amber-700' :
+                            'bg-purple-950 text-purple-400 border border-purple-700'
+                          }`}>
+                            {inv.payment_mode}
+                          </span>
+                          {inv.status === 'CANCELLED' && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-950 text-rose-400 border border-rose-700 font-bold">CANCELLED</span>
+                          )}
+                        </div>
+                        <div className="text-slate-400 text-[11px] mt-0.5">
+                          Cust: <span className="text-slate-200 font-medium">{inv.customer_name || 'Walk-in'}</span> • {inv.lines?.length || 0} items • Date: {new Date(inv.invoice_date).toLocaleDateString()} {new Date(inv.invoice_date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <CurrencyCell amount={inv.grand_total} highlight="emerald" size="base" />
+                        <button
+                          onClick={() => handleReprintInvoice(inv)}
+                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition shadow-sm"
+                          title="View and reprint this bill slip"
+                        >
+                          <Printer className="w-3.5 h-3.5" />
+                          <span>Get / Print Bill</span>
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )
+              )}
               {docManagerTab === 'QUOTES' && (
                 recentQuotes.length === 0 ? (
                   <div className="text-center p-8 text-slate-500">No recent quotations found.</div>
@@ -1411,19 +1792,39 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                   <div className="text-center p-8 text-slate-500">No recent sales returns found.</div>
                 ) : (
                   recentReturns.map(ret => (
-                    <div key={ret.id} className="p-3 rounded-xl bg-slate-800/80 border border-slate-700 flex items-center justify-between">
-                      <div>
-                        <div className="font-bold text-white flex items-center gap-2">
-                          <span>{ret.return_number}</span>
-                          <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-rose-950 text-rose-400 border border-rose-700">
-                            {ret.refund_mode}
-                          </span>
+                    <div key={ret.id} className="p-3.5 rounded-xl bg-slate-800/80 border border-slate-700 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="font-bold text-white flex items-center gap-2">
+                            <span>{ret.return_number}</span>
+                            <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-rose-950 text-rose-400 border border-rose-700">
+                              {ret.refund_mode}
+                            </span>
+                          </div>
+                          <div className="text-slate-400 text-[11px] mt-0.5">
+                            Cust: {ret.customer_name} • Reason: {ret.reason || 'Material return'}
+                          </div>
                         </div>
-                        <div className="text-slate-400 text-[11px] mt-0.5">
-                          Cust: {ret.customer_name} • Reason: {ret.reason || 'Material return'}
-                        </div>
+                        <CurrencyCell amount={ret.grand_total} highlight="amber" size="base" />
                       </div>
-                      <CurrencyCell amount={ret.grand_total} highlight="amber" size="base" />
+
+                      {/* Items with Condition Breakdown */}
+                      {ret.lines && ret.lines.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 pt-1.5 border-t border-slate-700/60">
+                          {ret.lines.map((l, i) => (
+                            <span
+                              key={i}
+                              className={`text-[10px] px-2.5 py-0.5 rounded-full font-mono flex items-center gap-1 border font-semibold ${
+                                l.return_condition === 'DAMAGED'
+                                  ? 'bg-rose-950 text-rose-300 border-rose-800'
+                                  : 'bg-emerald-950 text-emerald-300 border-emerald-800'
+                              }`}
+                            >
+                              {l.return_condition === 'DAMAGED' ? '❌ Damaged (Not Restocked)' : '✅ Excess (Restocked)'}: {l.quantity} {l.unit_name}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))
                 )
@@ -1439,7 +1840,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
           <div className="bg-slate-900 border border-red-500/50 rounded-2xl max-w-sm w-full p-5 space-y-4 shadow-2xl">
             <div className="flex items-center gap-2.5 text-red-400">
               <ShieldAlert className="w-6 h-6" />
-              <h3 className="font-bold text-white text-base">Credit Limit Exceeded</h3>
+              <h3 className="font-bold text-white text-base">Owner Approval Required (Credit Limit / Floor Price)</h3>
             </div>
 
             <p className="text-xs text-slate-300">
@@ -1509,9 +1910,11 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 <input
                   type="number"
                   step="any"
+                  placeholder="0.00"
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-sm"
                   value={cashPart}
-                  onChange={(e) => setCashPart(e.target.value)}
+                  onFocus={(e) => e.target.select()}
+                  onChange={(e) => setCashPart(e.target.value.replace(/^0+(?=\d)/, ''))}
                 />
               </div>
               <div>
@@ -1519,9 +1922,11 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 <input
                   type="number"
                   step="any"
+                  placeholder="0.00"
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-sm"
                   value={upiPart}
-                  onChange={(e) => setUpiPart(e.target.value)}
+                  onFocus={(e) => e.target.select()}
+                  onChange={(e) => setUpiPart(e.target.value.replace(/^0+(?=\d)/, ''))}
                 />
               </div>
               <div>
@@ -1529,9 +1934,11 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 <input
                   type="number"
                   step="any"
+                  placeholder="0.00"
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-sm"
                   value={creditPart}
-                  onChange={(e) => setCreditPart(e.target.value)}
+                  onFocus={(e) => e.target.select()}
+                  onChange={(e) => setCreditPart(e.target.value.replace(/^0+(?=\d)/, ''))}
                 />
               </div>
             </div>
@@ -1544,11 +1951,7 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 Cancel
               </button>
               <button
-                onClick={() => {
-                  setPaymentMode('SPLIT');
-                  setShowSplitModal(false);
-                  setShowReceiptModal(true);
-                }}
+                onClick={confirmSplit}
                 className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow"
               >
                 Confirm Split & Proceed
@@ -1695,6 +2098,150 @@ export const BillingPOS: React.FC<BillingPOSProps> = ({ products, parties, langu
                 >
                   <UserPlus className="w-3.5 h-3.5" />
                   <span>{isSavingCustomer ? 'Saving...' : (language === 'ta' ? 'சேமி & பில்லில் இணை' : 'Save & Link to Bill')}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Customer Modal */}
+      {showEditCustModal && selectedParty && (
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-5 space-y-4 shadow-2xl animate-in fade-in duration-200">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-2">
+                <Pencil className="w-5 h-5 text-blue-400" />
+                <div>
+                  <h3 className="font-bold text-white text-base">
+                    {language === 'ta' ? 'வாடிக்கையாளர் விவரங்களை மாற்று' : 'Edit Customer Details'}
+                  </h3>
+                  <div className="text-[11px] text-slate-400 font-mono">
+                    Bal: ₹{Number(selectedParty.current_balance ?? 0).toFixed(0)}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowEditCustModal(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditCustomer} className="space-y-3">
+              <div>
+                <label className="text-xs text-slate-300 font-semibold block mb-1">
+                  {language === 'ta' ? 'வாடிக்கையாளர் / நிறுவனப் பெயர் *' : 'Customer / Firm Name *'}
+                </label>
+                <input
+                  type="text"
+                  required
+                  autoFocus
+                  value={editCustName}
+                  onChange={(e) => setEditCustName(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs focus:border-blue-500"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'கைபேசி எண்' : 'Mobile / WhatsApp'}
+                  </label>
+                  <input
+                    type="tel"
+                    placeholder="98421 12345"
+                    value={editCustPhone}
+                    onChange={(e) => setEditCustPhone(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-xs focus:border-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">GSTIN</label>
+                  <input
+                    type="text"
+                    maxLength={15}
+                    placeholder="33AABCM..."
+                    value={editCustGstin}
+                    onChange={(e) => setEditCustGstin(e.target.value.toUpperCase())}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono uppercase text-white text-xs focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'விலைத் தட்டு' : 'Price Tier'}
+                  </label>
+                  <select
+                    value={editCustPriceTier}
+                    onChange={(e) => setEditCustPriceTier(e.target.value as any)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs focus:border-blue-500"
+                  >
+                    <option value="CONTRACTOR">Contractor (ஒப்பந்ததாரர்)</option>
+                    <option value="RETAIL">Retail (சில்லறை)</option>
+                    <option value="WHOLESALE">Wholesale (மொத்த)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'கடன் வரம்பு (₹)' : 'Credit Limit (₹)'}
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1000"
+                    value={editCustCreditLimit}
+                    onChange={(e) => setEditCustCreditLimit(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-xs focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs text-slate-300 font-semibold block mb-1">
+                  {language === 'ta' ? 'கடன் நாட்கள்' : 'Credit Days'}
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  value={editCustCreditDays}
+                  onChange={(e) => setEditCustCreditDays(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-xs focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-slate-300 font-semibold block mb-1">
+                  {language === 'ta' ? 'முகவரி (Billing Address)' : 'Billing Address'}
+                </label>
+                <textarea
+                  rows={2}
+                  placeholder="Street, Area, Town..."
+                  value={editCustAddress}
+                  onChange={(e) => setEditCustAddress(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs focus:border-blue-500"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setShowEditCustModal(false)}
+                  className="px-3.5 py-2 rounded-lg bg-slate-800 text-slate-300 text-xs font-semibold hover:bg-slate-700 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isUpdatingCustomer}
+                  className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs font-bold transition shadow-md flex items-center gap-1.5"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                  <span>{isUpdatingCustomer ? 'Saving...' : (language === 'ta' ? 'மாற்றங்களைச் சேமி' : 'Save Changes')}</span>
                 </button>
               </div>
             </form>

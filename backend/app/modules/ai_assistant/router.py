@@ -1,7 +1,7 @@
 """API router for AI Business Assistant."""
 
 from typing import List
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.rls_session import get_tenant_db_session, get_current_tenant_id
@@ -31,7 +31,10 @@ async def ask_assistant(
     - 'Customer summary for Suresh' / 'சுரேஷ் கணக்கு விவரம் என்ன?'
     - 'Whom do I owe money to?' / 'சப்ளையர்களுக்கு நான் கொடுக்க வேண்டிய தொகை எவ்வளவு?'
     """
-    tenant_id = payload.tenant_id or get_current_tenant_id()
+    # Tenant always comes from the RLS-scoped session context (X-Tenant-ID), never from the request body.
+    tenant_id = get_current_tenant_id()
+    if payload.tenant_id and payload.tenant_id != tenant_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="tenant_id does not match the session tenant")
     return await AIAssistantService.process_query(
         session=session,
         tenant_id=tenant_id,

@@ -236,7 +236,8 @@ async def test_product_price_history_and_update():
         from app.core.database import async_session_factory
 
         async with async_session_factory() as session:
-            pl = (await session.execute(select(PriceList).where(PriceList.code == "RETAIL"))).scalar_one()
+            pl = (await session.execute(select(PriceList).where(
+                PriceList.tenant_id == headers["X-Tenant-ID"], PriceList.code == "RETAIL"))).scalar_one()
             retail_pl_id = pl.id
 
         update_payload = {

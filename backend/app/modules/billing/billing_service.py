@@ -11,8 +11,9 @@ from sqlalchemy.orm import selectinload
 
 from app.models.tenant import Tenant, NumberSeries
 from app.models.catalogue import Product, ProductUnit, PriceList, ProductPrice
-from app.models.stock import Godown, StockMovement, StockBalance
-from app.models.ledger import Party, LedgerEntry
+from app.core.timeutils import ist_date_of, to_utc
+from app.models.stock import Godown, StockMovement, StockBalance, StockAlert
+from app.models.ledger import Party, LedgerEntry, PaymentAllocation
 from app.models.billing import (
     SalesInvoice,
     SalesInvoiceLine,
@@ -77,6 +78,17 @@ class BillingService:
         else:
             series.current_number += 1
             num = series.current_number
+
+        # Offline counters sync invoices numbered from the same series; skip numbers already taken
+        if doc_type == "SALES_INVOICE":
+            while await session.scalar(
+                select(SalesInvoice.id).where(
+                    SalesInvoice.tenant_id == tenant_id,
+                    SalesInvoice.invoice_number == f"{series.prefix}{num:04d}",
+                )
+            ):
+                series.current_number = num + 1
+                num = series.current_number
 
         return f"{series.prefix}{num:04d}"
 
@@ -194,7 +206,8 @@ class BillingService:
             # Price map for current price list
             price_map: Dict[str, Decimal] = {}
             for pr in p.prices:
-                if price_list_id and pr.price_list_id == price_list_id:
+                # Only the current (non-archived) price row counts; archived rows keep price history
+                if price_list_id and pr.price_list_id == price_list_id and pr.effective_to is None:
                     price_map[pr.unit_name] = pr.price
 
             # Build unit info list
@@ -221,12 +234,8 @@ class BillingService:
                     )
                 )
 
-            # Default GST rate: hardware standard 18% unless steel (18%), paint (18%), cement (28%)
-            gst_rate = Decimal("18.00")
-            if p.hsn_code.startswith("72") or p.hsn_code.startswith("73"):
-                gst_rate = Decimal("18.00")
-            elif p.hsn_code.startswith("2523"):
-                gst_rate = Decimal("28.00")
+            # GST slab comes from the product master (0/5/12/18/28)
+            gst_rate = p.gst_rate_percent if p.gst_rate_percent is not None else Decimal("18.00")
 
             results.append(
                 ProductSearchItemSchema(
@@ -309,10 +318,34 @@ class BillingService:
         payload: SalesInvoiceCreateSchema,
     ) -> SalesInvoice:
         """Calculate GST, write SalesInvoice + Lines, update StockMovements & Balances, and write Ledger."""
+        # 0. Idempotent offline sync: a re-sent offline invoice returns the already-posted copy.
+        if payload.invoice_number:
+            existing = await session.scalar(
+                select(SalesInvoice)
+                .where(
+                    SalesInvoice.tenant_id == tenant_id,
+                    SalesInvoice.invoice_number == payload.invoice_number,
+                )
+                .options(selectinload(SalesInvoice.lines))
+            )
+            if existing:
+                if payload.is_offline_created:
+                    return existing
+                raise ValueError(f"Invoice number {payload.invoice_number} already exists")
+
         # 1. Fetch Tenant profile for state and shop details
         tenant = await session.scalar(select(Tenant).where(Tenant.id == tenant_id))
         tenant_state = tenant.state_code if tenant else "33"
         is_inter_state = tenant_state != payload.place_of_supply_state_code
+
+        party: Optional[Party] = None
+        if payload.party_id:
+            party = await session.scalar(
+                select(Party).where(Party.id == payload.party_id, Party.tenant_id == tenant_id)
+            )
+        review_flags: List[str] = []
+        # Detailed rows persisted to stock_alerts for the owner review queue
+        alert_rows: List[Dict[str, Any]] = []
 
         # 2. Resolve Godown
         godown_id = payload.godown_id
@@ -328,8 +361,10 @@ class BillingService:
                 raise ValueError("No active godown found for tenant")
             godown_id = primary_godown.id
 
-        # 3. Resolve Price List
+        # 3. Resolve Price List (explicit > party's tier (Contractor/Wholesale) > default Retail)
         price_list_id = payload.price_list_id
+        if not price_list_id and party and party.price_list_id:
+            price_list_id = party.price_list_id
         if not price_list_id:
             default_pl = await session.scalar(
                 select(PriceList).where(
@@ -357,7 +392,8 @@ class BillingService:
             )
 
         invoice_id = str(uuid.uuid4())
-        invoice_date = payload.invoice_date or datetime.now(timezone.utc)
+        # Stored in UTC; business dates (ledger entry_date, reports) are derived in IST
+        invoice_date = to_utc(payload.invoice_date) or datetime.now(timezone.utc)
 
         # 5. Calculate Lines
         invoice_lines: List[SalesInvoiceLine] = []
@@ -370,16 +406,66 @@ class BillingService:
         # Cache products and stock balances
         for idx, line_in in enumerate(payload.lines, start=1):
             product = await session.scalar(
-                select(Product).where(Product.id == line_in.product_id, Product.tenant_id == tenant_id)
+                select(Product)
+                .where(Product.id == line_in.product_id, Product.tenant_id == tenant_id)
+                .options(selectinload(Product.units))
             )
             if not product:
                 raise ValueError(f"Product {line_in.product_id} not found")
 
-            # Calculate base quantity
-            if line_in.is_variable_weight and line_in.actual_weight_kg is not None:
+            # Catalogue conversion factor is authoritative (stock must move in base units)
+            conv_factor = SmartUnitConverter.resolve_conversion_factor(
+                product.units, line_in.unit_name, line_in.conversion_factor
+            )
+
+            # Calculate base quantity (variable-weight items move by actual weighed kg)
+            is_var_weight = line_in.is_variable_weight or product.is_variable_weight
+            if is_var_weight and line_in.actual_weight_kg is not None:
                 base_qty = line_in.actual_weight_kg.quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
             else:
-                base_qty = (line_in.quantity * line_in.conversion_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
+                base_qty = (line_in.quantity * conv_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
+
+            # Floor price protection for the applied price list (Retail / Wholesale / Contractor)
+            floor_price = await session.scalar(
+                select(ProductPrice.min_allowed_price).where(
+                    ProductPrice.tenant_id == tenant_id,
+                    ProductPrice.product_id == product.id,
+                    ProductPrice.price_list_id == price_list_id,
+                    func.lower(ProductPrice.unit_name) == line_in.unit_name.strip().lower(),
+                    ProductPrice.effective_to.is_(None),
+                )
+            )
+            if floor_price is not None and line_in.unit_price < floor_price:
+                if payload.is_offline_created or payload.owner_override:
+                    if "BELOW_FLOOR_PRICE" not in review_flags:
+                        review_flags.append("BELOW_FLOOR_PRICE")
+                    alert_rows.append({
+                        "alert_type": "BELOW_FLOOR_PRICE",
+                        "product_id": product.id,
+                        "message": (
+                            f"Line {idx}: {product.code}/{line_in.unit_name} sold at {line_in.unit_price} "
+                            f"below floor price {floor_price}"
+                        ),
+                    })
+                else:
+                    raise ValueError(
+                        f"Price {line_in.unit_price} for {product.code}/{line_in.unit_name} is below the "
+                        f"floor price {floor_price}. Owner override required."
+                    )
+
+            # Cost at sale = current godown Weighted Average Cost (fallback: last landed cost)
+            cost_sb = await session.scalar(
+                select(StockBalance).where(
+                    StockBalance.tenant_id == tenant_id,
+                    StockBalance.godown_id == godown_id,
+                    StockBalance.product_id == product.id,
+                )
+            )
+            cost_at_sale = (
+                cost_sb.weighted_avg_cost_base
+                if cost_sb and cost_sb.weighted_avg_cost_base > Decimal("0")
+                else product.purchase_price_base
+            )
 
             # Gross & Discount
             gross = (line_in.quantity * line_in.unit_price).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
@@ -390,8 +476,8 @@ class BillingService:
             disc = min(disc, gross)
             taxable = gross - disc
 
-            # GST rate
-            gst_rate = line_in.gst_rate_percent or Decimal("18.00")
+            # GST rate: an explicit rate (incl. 0% / exempt) is honoured; a missing rate uses the product's slab
+            gst_rate = line_in.gst_rate_percent if line_in.gst_rate_percent is not None else product.gst_rate_percent
             hsn = line_in.hsn_code or product.hsn_code
 
             if is_inter_state:
@@ -427,12 +513,12 @@ class BillingService:
                 line_number=idx,
                 product_id=product.id,
                 unit_name=line_in.unit_name,
-                conversion_factor=line_in.conversion_factor,
+                conversion_factor=conv_factor,
                 quantity=line_in.quantity,
                 actual_weight_kg=line_in.actual_weight_kg,
                 base_quantity=base_qty,
                 unit_price=line_in.unit_price,
-                cost_price_base_at_sale=product.purchase_price_base,
+                cost_price_base_at_sale=cost_at_sale,
                 discount_type=line_in.discount_type,
                 discount_value=line_in.discount_value,
                 discount_amount=disc,
@@ -451,17 +537,36 @@ class BillingService:
 
         total_tax = total_cgst + total_sgst + total_igst
         exact_total = subtotal_taxable + total_tax
-        grand_total = exact_total.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        grand_total = exact_total.quantize(Decimal("1"), rounding=ROUND_HALF_UP).quantize(TWO_PLACES)
         round_off = (grand_total - exact_total).quantize(TWO_PLACES)
 
         # Paid & Due
         if payload.paid_amount is not None:
-            paid = min(payload.paid_amount, grand_total).quantize(TWO_PLACES)
+            paid = max(Decimal("0.00"), min(payload.paid_amount, grand_total)).quantize(TWO_PLACES)
         elif payload.payment_mode in ("CASH", "UPI", "CARD"):
             paid = grand_total
         else:  # CREDIT
             paid = Decimal("0.00")
         due = (grand_total - paid).quantize(TWO_PLACES)
+
+        # Credit limit check on the credit (unpaid) portion of this bill
+        if party and due > Decimal("0.00") and party.credit_limit > Decimal("0.00"):
+            projected_balance = party.current_balance + due
+            if projected_balance > party.credit_limit:
+                if payload.is_offline_created or payload.owner_override:
+                    review_flags.append("CREDIT_LIMIT_EXCEEDED")
+                    alert_rows.append({
+                        "alert_type": "CREDIT_LIMIT_EXCEEDED",
+                        "message": (
+                            f"{party.name}: projected balance {projected_balance} exceeds credit limit "
+                            f"{party.credit_limit}"
+                        ),
+                    })
+                else:
+                    raise ValueError(
+                        f"Credit limit exceeded for {party.name}: projected balance {projected_balance} "
+                        f"> limit {party.credit_limit}. Owner override required."
+                    )
 
         # Dynamic UPI QR
         shop_vpa = "store@icici"
@@ -544,9 +649,25 @@ class BillingService:
                         last_movement_at=invoice_date,
                     )
                     session.add(sb)
+                    await session.flush()  # make the new balance visible to later lines (autoflush is off)
                 else:
                     sb.current_quantity_base -= line.base_quantity
                     sb.last_movement_at = invoice_date
+
+                # Negative stock is allowed on POS sales but flagged for owner review
+                if sb.current_quantity_base < Decimal("0"):
+                    if "NEGATIVE_STOCK_WARNING" not in review_flags:
+                        review_flags.append("NEGATIVE_STOCK_WARNING")
+                    # One alert per product (keep the latest, most negative balance)
+                    alert_rows = [
+                        a for a in alert_rows
+                        if not (a["alert_type"] == "NEGATIVE_STOCK_WARNING" and a.get("product_id") == line.product_id)
+                    ]
+                    alert_rows.append({
+                        "alert_type": "NEGATIVE_STOCK_WARNING",
+                        "product_id": line.product_id,
+                        "message": f"Stock went negative: balance {sb.current_quantity_base} base units after this bill",
+                    })
         else:
             # Mark delivery challan as INVOICED
             dc = await session.scalar(
@@ -560,46 +681,75 @@ class BillingService:
                 dc.invoiced_invoice_id = invoice.id
 
         # 7. Customer Ledger Entry
-        if payload.party_id:
-            party = await session.scalar(
-                select(Party).where(Party.id == payload.party_id, Party.tenant_id == tenant_id)
+        if party:
+            # Debit customer account for the invoice grand total
+            le_inv = LedgerEntry(
+                id=str(uuid.uuid4()),
+                tenant_id=tenant_id,
+                party_id=party.id,
+                entry_type="SALES_INVOICE",
+                debit_amount=grand_total,
+                credit_amount=Decimal("0.00"),
+                reference_doc_type="SALES_INVOICE",
+                reference_doc_id=invoice.id,
+                reference_doc_number=invoice.invoice_number,
+                entry_date=ist_date_of(invoice_date),
+                notes=f"Sales Invoice {invoice.invoice_number}",
             )
-            if party:
-                # Debit customer account for the invoice grand total
-                le_inv = LedgerEntry(
+            session.add(le_inv)
+
+            # If counter payment was received, add immediate Payment Receipt credit entry
+            if paid > Decimal("0.00"):
+                le_pay = LedgerEntry(
+                    id=str(uuid.uuid4()),
                     tenant_id=tenant_id,
                     party_id=party.id,
-                    entry_type="SALES_INVOICE",
-                    debit_amount=grand_total,
-                    credit_amount=Decimal("0.00"),
+                    entry_type="PAYMENT_RECEIPT",
+                    debit_amount=Decimal("0.00"),
+                    credit_amount=paid,
                     reference_doc_type="SALES_INVOICE",
                     reference_doc_id=invoice.id,
                     reference_doc_number=invoice.invoice_number,
-                    entry_date=invoice_date.date(),
-                    notes=f"Sales Invoice {invoice.invoice_number}",
+                    entry_date=ist_date_of(invoice_date),
+                    notes=f"Payment for {invoice.invoice_number} via {payload.payment_mode}",
                 )
-                session.add(le_inv)
-
-                # If counter payment was received, add immediate Payment Receipt credit entry
-                if paid > Decimal("0.00"):
-                    le_pay = LedgerEntry(
+                session.add(le_pay)
+                # Settle the counter payment against this very bill so it never shows as an open due
+                session.add(
+                    PaymentAllocation(
+                        id=str(uuid.uuid4()),
                         tenant_id=tenant_id,
-                        party_id=party.id,
-                        entry_type="PAYMENT_RECEIPT",
-                        debit_amount=Decimal("0.00"),
-                        credit_amount=paid,
-                        reference_doc_type="SALES_INVOICE",
-                        reference_doc_id=invoice.id,
-                        reference_doc_number=invoice.invoice_number,
-                        entry_date=invoice_date.date(),
-                        notes=f"Payment for {invoice.invoice_number} via {payload.payment_mode}",
+                        payment_entry_id=le_pay.id,
+                        invoice_entry_id=le_inv.id,
+                        allocated_amount=paid,
                     )
-                    session.add(le_pay)
+                )
 
-                # Update party balance: balance increases by net due
-                party.current_balance += due
+            # Update party balance: balance increases by net due
+            party.current_balance += due
+
+        # 8. Persist owner review flags (accepted conflicts are never silently lost)
+        for alert in alert_rows:
+            session.add(
+                StockAlert(
+                    id=str(uuid.uuid4()),
+                    tenant_id=tenant_id,
+                    alert_type=alert["alert_type"],
+                    status="OPEN",
+                    reference_doc_type="SALES_INVOICE",
+                    reference_doc_id=invoice.id,
+                    reference_doc_number=invoice.invoice_number,
+                    product_id=alert.get("product_id"),
+                    party_id=party.id if party else None,
+                    godown_id=godown_id,
+                    message=alert["message"],
+                    is_offline_created=payload.is_offline_created,
+                    owner_override=payload.owner_override,
+                )
+            )
 
         await session.commit()
+        invoice.review_flags = review_flags
         return invoice
 
     # -------------------------------------------------------------------------
@@ -636,7 +786,7 @@ class BillingService:
             )
 
         return_id = str(uuid.uuid4())
-        return_date = payload.return_date or datetime.now(timezone.utc)
+        return_date = to_utc(payload.return_date) or datetime.now(timezone.utc)
 
         lines: List[SalesReturnLine] = []
         subtotal = Decimal("0.00")
@@ -644,14 +794,19 @@ class BillingService:
 
         for idx, line_in in enumerate(payload.lines, start=1):
             product = await session.scalar(
-                select(Product).where(Product.id == line_in.product_id, Product.tenant_id == tenant_id)
+                select(Product)
+                .where(Product.id == line_in.product_id, Product.tenant_id == tenant_id)
+                .options(selectinload(Product.units))
             )
             if not product:
                 raise ValueError(f"Product {line_in.product_id} not found")
 
-            base_qty = (line_in.quantity * line_in.conversion_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
+            conv_factor = SmartUnitConverter.resolve_conversion_factor(
+                product.units, line_in.unit_name, line_in.conversion_factor
+            )
+            base_qty = (line_in.quantity * conv_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
             taxable = (line_in.quantity * line_in.unit_price).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
-            gst_rate = line_in.gst_rate_percent or Decimal("0.00")
+            gst_rate = line_in.gst_rate_percent if line_in.gst_rate_percent is not None else product.gst_rate_percent
             tax_amt = (taxable * (gst_rate / Decimal("100"))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
             line_tot = taxable + tax_amt
 
@@ -665,7 +820,7 @@ class BillingService:
                 line_number=idx,
                 product_id=product.id,
                 unit_name=line_in.unit_name,
-                conversion_factor=line_in.conversion_factor,
+                conversion_factor=conv_factor,
                 quantity=line_in.quantity,
                 base_quantity=base_qty,
                 unit_price=line_in.unit_price,
@@ -673,6 +828,7 @@ class BillingService:
                 gst_rate_percent=gst_rate,
                 tax_amount=tax_amt,
                 line_total=line_tot,
+                return_condition=getattr(line_in, "return_condition", "EXCESS") or "EXCESS",
             )
             lines.append(line_obj)
 
@@ -698,21 +854,10 @@ class BillingService:
         )
         session.add(sales_return)
 
-        # Replenish Stock (+ base_quantity)
+        # Replenish Stock (+ base_quantity) at cost (WAC), never at the selling price
+        # Only EXCESS / Good Condition items are added to sellable stock.
+        # DAMAGED items are logged for audit but kept out of sellable inventory.
         for line in lines:
-            sm = StockMovement(
-                tenant_id=tenant_id,
-                godown_id=godown_id,
-                product_id=line.product_id,
-                movement_type="SALES_RETURN",
-                quantity_base=line.base_quantity,  # positive
-                unit_cost_base=line.unit_price,
-                reference_doc_type="SALES_RETURN",
-                reference_doc_id=sales_return.id,
-                reference_doc_number=sales_return.return_number,
-            )
-            session.add(sm)
-
             sb = await session.scalar(
                 select(StockBalance).where(
                     StockBalance.tenant_id == tenant_id,
@@ -720,19 +865,49 @@ class BillingService:
                     StockBalance.product_id == line.product_id,
                 )
             )
-            if sb:
-                sb.current_quantity_base += line.base_quantity
-                sb.last_movement_at = return_date
-            else:
-                sb = StockBalance(
-                    tenant_id=tenant_id,
-                    godown_id=godown_id,
-                    product_id=line.product_id,
-                    current_quantity_base=line.base_quantity,
-                    weighted_avg_cost_base=line.unit_price,
-                    last_movement_at=return_date,
+            prod_cost = await session.scalar(
+                select(Product.purchase_price_base).where(
+                    Product.id == line.product_id, Product.tenant_id == tenant_id
                 )
-                session.add(sb)
+            ) or Decimal("0.0000")
+            return_cost = (
+                sb.weighted_avg_cost_base
+                if sb and sb.weighted_avg_cost_base > Decimal("0")
+                else prod_cost
+            )
+
+            is_damaged = line.return_condition == "DAMAGED"
+            mov_type = "SALES_RETURN_DAMAGED" if is_damaged else "SALES_RETURN"
+            doc_num = f"{sales_return.return_number} (DAMAGED)" if is_damaged else sales_return.return_number
+
+            sm = StockMovement(
+                tenant_id=tenant_id,
+                godown_id=godown_id,
+                product_id=line.product_id,
+                movement_type=mov_type,
+                quantity_base=line.base_quantity,
+                unit_cost_base=return_cost,
+                reference_doc_type="SALES_RETURN",
+                reference_doc_id=sales_return.id,
+                reference_doc_number=doc_num,
+            )
+            session.add(sm)
+
+            if not is_damaged:
+                if sb:
+                    sb.current_quantity_base += line.base_quantity
+                    sb.last_movement_at = return_date
+                else:
+                    sb = StockBalance(
+                        tenant_id=tenant_id,
+                        godown_id=godown_id,
+                        product_id=line.product_id,
+                        current_quantity_base=line.base_quantity,
+                        weighted_avg_cost_base=return_cost,
+                        last_movement_at=return_date,
+                    )
+                    session.add(sb)
+                    await session.flush()  # make the new balance visible to later lines (autoflush is off)
 
         # Financial Ledger Update
         if payload.party_id and payload.refund_mode == "CREDIT_NOTE":
@@ -741,6 +916,7 @@ class BillingService:
             )
             if party:
                 le = LedgerEntry(
+                    id=str(uuid.uuid4()),
                     tenant_id=tenant_id,
                     party_id=party.id,
                     entry_type="SALES_RETURN_CREDIT_NOTE",
@@ -749,11 +925,42 @@ class BillingService:
                     reference_doc_type="SALES_RETURN",
                     reference_doc_id=sales_return.id,
                     reference_doc_number=sales_return.return_number,
-                    entry_date=return_date.date(),
+                    entry_date=ist_date_of(return_date),
                     notes=f"Sales Return Credit Note {sales_return.return_number}",
                 )
                 session.add(le)
                 party.current_balance -= grand_total
+
+                # Settle the credit note against the original bill's open due; any excess stays
+                # unallocated (customer advance). Keeps: unpaid invoices - advances == balance.
+                if payload.original_invoice_id:
+                    inv_entry = await session.scalar(
+                        select(LedgerEntry).where(
+                            LedgerEntry.tenant_id == tenant_id,
+                            LedgerEntry.party_id == party.id,
+                            LedgerEntry.entry_type == "SALES_INVOICE",
+                            LedgerEntry.reference_doc_id == payload.original_invoice_id,
+                        )
+                    )
+                    if inv_entry:
+                        already_allocated = await session.scalar(
+                            select(func.coalesce(func.sum(PaymentAllocation.allocated_amount), Decimal("0"))).where(
+                                PaymentAllocation.tenant_id == tenant_id,
+                                PaymentAllocation.invoice_entry_id == inv_entry.id,
+                            )
+                        ) or Decimal("0")
+                        open_due = max(Decimal("0.00"), inv_entry.debit_amount - already_allocated)
+                        settle = min(grand_total, open_due).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+                        if settle > Decimal("0.00"):
+                            session.add(
+                                PaymentAllocation(
+                                    id=str(uuid.uuid4()),
+                                    tenant_id=tenant_id,
+                                    payment_entry_id=le.id,
+                                    invoice_entry_id=inv_entry.id,
+                                    allocated_amount=settle,
+                                )
+                            )
 
         await session.commit()
         return sales_return
@@ -782,8 +989,12 @@ class BillingService:
                 raise ValueError("No active godown found for tenant")
             godown_id = primary_godown.id
 
-        # Resolve Price List
+        # Resolve Price List (explicit > party's tier > default)
         price_list_id = payload.price_list_id
+        if not price_list_id and payload.party_id:
+            price_list_id = await session.scalar(
+                select(Party.price_list_id).where(Party.id == payload.party_id, Party.tenant_id == tenant_id)
+            )
         if not price_list_id:
             default_pl = await session.scalar(
                 select(PriceList).where(
@@ -823,7 +1034,7 @@ class BillingService:
             gross = (line_in.quantity * line_in.unit_price).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
             disc = min(line_in.discount_amount, gross).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
             taxable = gross - disc
-            gst_rate = line_in.gst_rate_percent or Decimal("18.00")
+            gst_rate = line_in.gst_rate_percent if line_in.gst_rate_percent is not None else product.gst_rate_percent
             tax_amt = (taxable * (gst_rate / Decimal("100"))).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
             line_tot = taxable + tax_amt
 
@@ -850,7 +1061,7 @@ class BillingService:
             lines.append(line_obj)
 
         exact_total = subtotal + total_tax
-        grand_total = exact_total.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        grand_total = exact_total.quantize(Decimal("1"), rounding=ROUND_HALF_UP).quantize(TWO_PLACES)
         round_off = (grand_total - exact_total).quantize(TWO_PLACES)
 
         quote = Quotation(
@@ -979,12 +1190,17 @@ class BillingService:
 
         for idx, line_in in enumerate(payload.lines, start=1):
             product = await session.scalar(
-                select(Product).where(Product.id == line_in.product_id, Product.tenant_id == tenant_id)
+                select(Product)
+                .where(Product.id == line_in.product_id, Product.tenant_id == tenant_id)
+                .options(selectinload(Product.units))
             )
             if not product:
                 raise ValueError(f"Product {line_in.product_id} not found")
 
-            base_qty = (line_in.quantity * line_in.conversion_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
+            conv_factor = SmartUnitConverter.resolve_conversion_factor(
+                product.units, line_in.unit_name, line_in.conversion_factor
+            )
+            base_qty = (line_in.quantity * conv_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
             line_tot = (line_in.quantity * line_in.unit_price).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
             grand_total += line_tot
 
@@ -995,7 +1211,7 @@ class BillingService:
                 line_number=idx,
                 product_id=product.id,
                 unit_name=line_in.unit_name,
-                conversion_factor=line_in.conversion_factor,
+                conversion_factor=conv_factor,
                 quantity=line_in.quantity,
                 base_quantity=base_qty,
                 unit_price=line_in.unit_price,
@@ -1022,21 +1238,8 @@ class BillingService:
         )
         session.add(dc)
 
-        # Move stock immediately upon physical dispatch
+        # Move stock immediately upon physical dispatch (valued at WAC cost, not selling price)
         for line in lines:
-            sm = StockMovement(
-                tenant_id=tenant_id,
-                godown_id=godown_id,
-                product_id=line.product_id,
-                movement_type="DELIVERY_CHALLAN",
-                quantity_base=-line.base_quantity,
-                unit_cost_base=line.unit_price,
-                reference_doc_type="DELIVERY_CHALLAN",
-                reference_doc_id=dc.id,
-                reference_doc_number=dc.challan_number,
-            )
-            session.add(sm)
-
             sb = await session.scalar(
                 select(StockBalance).where(
                     StockBalance.tenant_id == tenant_id,
@@ -1044,6 +1247,30 @@ class BillingService:
                     StockBalance.product_id == line.product_id,
                 )
             )
+            prod_cost = await session.scalar(
+                select(Product.purchase_price_base).where(
+                    Product.id == line.product_id, Product.tenant_id == tenant_id
+                )
+            ) or Decimal("0.0000")
+            dispatch_cost = (
+                sb.weighted_avg_cost_base
+                if sb and sb.weighted_avg_cost_base > Decimal("0")
+                else prod_cost
+            )
+
+            sm = StockMovement(
+                tenant_id=tenant_id,
+                godown_id=godown_id,
+                product_id=line.product_id,
+                movement_type="DELIVERY_CHALLAN",
+                quantity_base=-line.base_quantity,
+                unit_cost_base=dispatch_cost,
+                reference_doc_type="DELIVERY_CHALLAN",
+                reference_doc_id=dc.id,
+                reference_doc_number=dc.challan_number,
+            )
+            session.add(sm)
+
             if sb:
                 sb.current_quantity_base -= line.base_quantity
                 sb.last_movement_at = challan_date
@@ -1053,10 +1280,11 @@ class BillingService:
                     godown_id=godown_id,
                     product_id=line.product_id,
                     current_quantity_base=-line.base_quantity,
-                    weighted_avg_cost_base=line.unit_price,
+                    weighted_avg_cost_base=dispatch_cost,
                     last_movement_at=challan_date,
                 )
                 session.add(sb)
+                await session.flush()  # make the new balance visible to later lines (autoflush is off)
 
         await session.commit()
         return dc

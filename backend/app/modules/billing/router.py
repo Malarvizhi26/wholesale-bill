@@ -1,7 +1,8 @@
 """Billing POS API router."""
 
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import desc, select
@@ -10,6 +11,8 @@ from sqlalchemy.orm import selectinload
 
 from app.core.rls_session import get_tenant_db_session, get_current_tenant_id
 from app.models.tenant import Tenant
+from app.models.stock import StockAlert
+from app.modules.auth.pin_service import check_owner_pin, require_owner_pin
 from app.models.billing import (
     SalesInvoice,
     SalesReturn,
@@ -38,6 +41,8 @@ from app.schemas.billing import (
     DeliveryChallanResponseSchema,
     UnitDecomposeRequestSchema,
     UnitDecomposeResponseSchema,
+    ReviewFlagResponseSchema,
+    ReviewFlagResolveSchema,
 )
 
 router = APIRouter(prefix="/billing", tags=["Billing"])
@@ -186,8 +191,14 @@ async def post_sales_invoice(
     payload: SalesInvoiceCreateSchema,
     session: AsyncSession = Depends(get_tenant_db_session),
 ):
-    """Post completed sales invoice: updates stock movements, stock balances, and party ledger."""
+    """Post completed sales invoice: updates stock movements, stock balances, and party ledger.
+
+    owner_override=true (credit-limit / floor-price breach approval) requires a valid owner_pin:
+    403 when the PIN is missing/wrong, 429 while the tenant is locked out after repeated wrong PINs.
+    """
     tenant_id = get_current_tenant_id()
+    if payload.owner_override:
+        await require_owner_pin(session, tenant_id, payload.owner_pin)
     try:
         return await BillingService.create_sales_invoice(
             session=session,
@@ -196,6 +207,48 @@ async def post_sales_invoice(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+class SyncInvoiceResult(BaseModel):
+    invoice_number: Optional[str] = None
+    status: str  # 'SYNCED' or 'ERROR'
+    invoice_id: Optional[str] = None
+    review_flags: List[str] = []
+    error: Optional[str] = None
+
+
+@router.post("/sync-invoices", response_model=List[SyncInvoiceResult])
+async def sync_offline_invoices(
+    payload: List[SalesInvoiceCreateSchema],
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Push queued offline counter invoices. Conflicts (negative stock, credit limit, floor price)
+    are accepted and returned as review_flags; re-sent invoices are idempotent."""
+    tenant_id = get_current_tenant_id()
+    results: List[SyncInvoiceResult] = []
+    for inv_in in payload:
+        inv_in.is_offline_created = True
+        # Offline bills are never rejected for a bad PIN: the override is simply not recorded as
+        # owner-approved, and every conflict is still flagged for owner review.
+        if inv_in.owner_override:
+            try:
+                inv_in.owner_override = await check_owner_pin(session, tenant_id, inv_in.owner_pin)
+            except HTTPException:  # locked out
+                inv_in.owner_override = False
+        try:
+            inv = await BillingService.create_sales_invoice(session=session, tenant_id=tenant_id, payload=inv_in)
+            results.append(
+                SyncInvoiceResult(
+                    invoice_number=inv.invoice_number,
+                    status="SYNCED",
+                    invoice_id=inv.id,
+                    review_flags=getattr(inv, "review_flags", []),
+                )
+            )
+        except ValueError as e:
+            await session.rollback()
+            results.append(SyncInvoiceResult(invoice_number=inv_in.invoice_number, status="ERROR", error=str(e)))
+    return results
 
 
 @router.get("/invoices", response_model=List[SalesInvoiceResponseSchema])
@@ -453,3 +506,47 @@ async def convert_challan(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+
+# -----------------------------------------------------------------------------
+# 7. Owner Review Flags (negative stock, credit limit, floor price conflicts)
+# -----------------------------------------------------------------------------
+
+@router.get("/review-flags", response_model=List[ReviewFlagResponseSchema])
+async def list_review_flags(
+    status_filter: Literal["OPEN", "RESOLVED", "ALL"] = Query("OPEN", alias="status"),
+    limit: int = Query(100, ge=1, le=500),
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Owner review queue. Defaults to OPEN items, newest first."""
+    tenant_id = get_current_tenant_id()
+    stmt = select(StockAlert).where(StockAlert.tenant_id == tenant_id)
+    if status_filter != "ALL":
+        stmt = stmt.where(StockAlert.status == status_filter)
+    stmt = stmt.order_by(desc(StockAlert.created_at)).limit(limit)
+    return (await session.execute(stmt)).scalars().all()
+
+
+@router.post("/review-flags/{flag_id}/resolve", response_model=ReviewFlagResponseSchema)
+async def resolve_review_flag(
+    flag_id: str,
+    payload: ReviewFlagResolveSchema,
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Owner marks a review flag as resolved (requires the owner PIN). The flag row is kept."""
+    tenant_id = get_current_tenant_id()
+    await require_owner_pin(session, tenant_id, payload.owner_pin)
+    flag = await session.scalar(
+        select(StockAlert).where(StockAlert.id == flag_id, StockAlert.tenant_id == tenant_id)
+    )
+    if not flag:
+        raise HTTPException(status_code=404, detail="Review flag not found")
+    if flag.status == "RESOLVED":
+        raise HTTPException(status_code=409, detail="Review flag is already resolved")
+    flag.status = "RESOLVED"
+    flag.resolved_at = datetime.now(timezone.utc)
+    flag.resolution_notes = payload.notes
+    await session.commit()
+    await session.refresh(flag)
+    return flag

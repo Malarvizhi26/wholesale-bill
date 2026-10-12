@@ -46,6 +46,10 @@ class Product(TenantScopedModel):
     min_stock_base: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0.0000"), nullable=False)
     reorder_quantity_base: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0.0000"), nullable=False)
     purchase_price_base: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0.0000"), nullable=False)
+    # Default GST slab (0/5/12/18/28) used when a bill line does not carry an explicit rate
+    gst_rate_percent: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2), default=Decimal("18.00"), server_default="18.00", nullable=False
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     units: Mapped[List["ProductUnit"]] = relationship("ProductUnit", back_populates="product", cascade="all, delete-orphan", lazy="selectin")

@@ -11,7 +11,7 @@ import {
   PackageCheck,
   Building2,
 } from 'lucide-react';
-import type { Language, OwnerMorningSnapshot } from '../types';
+import type { Language, OwnerMorningSnapshot, CollectionReminderItem, LowStockAlert } from '../types';
 import { CurrencyCell } from './ui/CurrencyCell';
 import { api } from '../api/client';
 import { Sparkles } from 'lucide-react';
@@ -19,19 +19,31 @@ import { Sparkles } from 'lucide-react';
 interface DashboardProps {
   language: Language;
   onOpenAssistant?: () => void;
+  onOpenReviewFlags?: () => void;
 }
 
-export const Dashboard: React.FC<DashboardProps> = ({ language, onOpenAssistant }) => {
+export const Dashboard: React.FC<DashboardProps> = ({ language, onOpenAssistant, onOpenReviewFlags: _onOpenReviewFlags }) => {
   const [snapshot, setSnapshot] = useState<OwnerMorningSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [topDebtors, setTopDebtors] = useState<CollectionReminderItem[]>([]);
+  const [lowStockItems, setLowStockItems] = useState<LowStockAlert[]>([]);
 
   const fetchSnapshot = async () => {
     setLoading(true);
     try {
-      const data = await api.getOwnerMorningSnapshot();
+      const [data, debtors, alerts] = await Promise.all([
+        api.getOwnerMorningSnapshot(),
+        api.getCollectionCallList(0, 0),
+        api.getLowStockAlerts(),
+      ]);
       setSnapshot(data);
-    } catch {
-      // offline fallback or defaults
+      setTopDebtors(debtors.slice(0, 5));
+      setLowStockItems(alerts.slice(0, 5));
+      setError(null);
+    } catch (err: any) {
+      // Never show invented figures: report the failure and show zeros
+      setError(err?.message || 'Failed to load owner snapshot');
     } finally {
       setLoading(false);
     }
@@ -41,20 +53,25 @@ export const Dashboard: React.FC<DashboardProps> = ({ language, onOpenAssistant 
     fetchSnapshot();
   }, []);
 
-  // Safe defaults if API loading or offline
-  const sales = snapshot?.today_sales ?? 68450;
-  const marginEst = snapshot?.gross_margin_estimate ?? 16975;
-  const marginPct = snapshot?.gross_margin_percent ?? 24.8;
-  const receivables = snapshot?.outstanding_receivables ?? 142800;
-  const cashDrawer = snapshot?.cash_in_drawer ?? 28340;
-  const expensesToday = snapshot?.operating_expenses_today ?? 2750;
-  const netProfit = snapshot?.net_operating_profit_today ?? (marginEst - expensesToday);
-  const stockValuation = snapshot?.stock_total_valuation ?? 485200;
-  const payables = snapshot?.payables_due_suppliers ?? 52000;
-  const lowStockCount = snapshot?.low_stock_alerts_count ?? 3;
+  // Real figures only (zeros until loaded / when the server is unreachable)
+  const sales = snapshot?.today_sales ?? 0;
+  const marginEst = snapshot?.gross_margin_estimate ?? 0;
+  const marginPct = snapshot?.gross_margin_percent ?? 0;
+  const receivables = snapshot?.outstanding_receivables ?? 0;
+  const cashDrawer = snapshot?.cash_in_drawer ?? 0;
+  const expensesToday = snapshot?.operating_expenses_today ?? 0;
+  const netProfit = snapshot?.net_operating_profit_today ?? 0;
+  const stockValuation = snapshot?.stock_total_valuation ?? 0;
+  const payables = snapshot?.payables_due_suppliers ?? 0;
+  const lowStockCount = snapshot?.low_stock_alerts_count ?? 0;
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-4 space-y-5">
+      {error && (
+        <div className="bg-red-950/70 border border-red-800 text-red-300 text-xs rounded-lg px-3 py-2">
+          Dashboard not loaded: {error}
+        </div>
+      )}
       {/* Morning Header */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-3 bg-gradient-to-r from-slate-800 to-slate-800/95 p-5 rounded-2xl border border-slate-700 shadow-xl">
         <div>
@@ -107,7 +124,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ language, onOpenAssistant 
             <CurrencyCell amount={sales} size="3xl" highlight="default" />
           </div>
           <div className="text-[11px] text-emerald-400 flex items-center gap-1 font-bold">
-            <span>{snapshot?.invoices_count_today ?? 12} Invoices Billed</span>
+            <span>{snapshot?.invoices_count_today ?? 0} Invoices Billed</span>
             <span className="text-slate-400 font-normal">today</span>
           </div>
         </div>
@@ -141,7 +158,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ language, onOpenAssistant 
           </div>
           <div className="text-[11px] text-red-400 flex items-center gap-1 font-bold">
             <AlertTriangle className="w-3.5 h-3.5" />
-            <span>{snapshot?.overdue_debtors_count ?? 6} parties overdue (&gt; 30 days)</span>
+            <span>{snapshot?.overdue_debtors_count ?? 0} parties overdue (&gt; 30 days)</span>
           </div>
         </div>
 
@@ -171,9 +188,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ language, onOpenAssistant 
               {language === 'ta' ? 'இன்றைய செலவு & நிகர லாபம்' : 'Expenses & Net Profit'}
             </div>
             <div className="flex items-center gap-2 mt-0.5">
-              <span className="text-sm font-bold font-mono text-purple-300">Exp: ₹{expensesToday.toLocaleString()}</span>
+              <span className="text-sm font-bold font-mono text-purple-300">Exp: ₹{expensesToday.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
               <span>•</span>
-              <span className="text-sm font-bold font-mono text-emerald-400">Net: ₹{netProfit.toLocaleString()}</span>
+              <span className="text-sm font-bold font-mono text-emerald-400">Net: ₹{netProfit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
             </div>
           </div>
           <Wallet className="w-6 h-6 text-purple-400/50" />
@@ -221,29 +238,30 @@ export const Dashboard: React.FC<DashboardProps> = ({ language, onOpenAssistant 
           </div>
 
           <div className="space-y-2.5">
-            {[
-              { name: 'Murugan Constructions', amount: 14250, days: 38, phone: '94433 22110', billNo: 'C1/26-27/0014' },
-              { name: 'Raja Mason (மேஸ்திரி ராஜா)', amount: 6200, days: 22, phone: '98421 55678', billNo: 'C1/26-27/0028' },
-              { name: 'Kandhasamy Builders', amount: 28400, days: 54, phone: '94431 88900', billNo: 'C1/26-27/0002' },
-            ].map((d, i) => (
-              <div key={i} className="flex items-center justify-between p-3 rounded-xl bg-slate-900 border border-slate-700/70 text-xs hover:border-slate-500 transition">
+            {topDebtors.length === 0 && (
+              <div className="text-center p-6 text-slate-500 text-xs">No outstanding customer dues.</div>
+            )}
+            {topDebtors.map((d) => (
+              <div key={d.party_id} className="flex items-center justify-between p-3 rounded-xl bg-slate-900 border border-slate-700/70 text-xs hover:border-slate-500 transition">
                 <div>
-                  <div className="font-bold text-white text-sm">{d.name}</div>
+                  <div className="font-bold text-white text-sm">{d.customer_name}</div>
                   <div className="text-slate-400 text-[11px] font-mono mt-0.5">
-                    Ph: {d.phone} • Inv: {d.billNo} • <span className="text-red-400 font-bold">{d.days} days overdue</span>
+                    Ph: {d.phone || '-'} • Inv: {d.oldest_bill_number || '-'} • <span className="text-red-400 font-bold">{d.days_overdue} days overdue</span>
                   </div>
                 </div>
                 <div className="text-right flex flex-col items-end">
-                  <CurrencyCell amount={d.amount} highlight="amber" size="lg" />
-                  <a
-                    href={`https://wa.me/91${d.phone.replace(/\D/g, '')}?text=Vanakkam%20${encodeURIComponent(d.name)},%20your%20pending%20balance%20to%20Salem%20Sri%20Murugan%20Hardware%20is%20Rs.${d.amount}.%20Kindly%20pay%20via%20UPI:%20upi://pay?pa=salemtraders@icici%26pn=Salem%20Hardware%26am=${d.amount}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-[11px] text-emerald-400 hover:text-emerald-300 font-semibold inline-flex items-center gap-1 mt-1 bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-800"
-                  >
-                    <span>Send Reminder</span>
-                    <ArrowUpRight className="w-3 h-3" />
-                  </a>
+                  <CurrencyCell amount={d.current_balance} highlight="amber" size="lg" />
+                  {d.phone && (
+                    <a
+                      href={`https://wa.me/91${d.phone.replace(/\D/g, '')}?text=${encodeURIComponent(d.whatsapp_message)}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-[11px] text-emerald-400 hover:text-emerald-300 font-semibold inline-flex items-center gap-1 mt-1 bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-800"
+                    >
+                      <span>Send Reminder</span>
+                      <ArrowUpRight className="w-3 h-3" />
+                    </a>
+                  )}
                 </div>
               </div>
             ))}
@@ -265,19 +283,18 @@ export const Dashboard: React.FC<DashboardProps> = ({ language, onOpenAssistant 
           </div>
 
           <div className="space-y-2.5">
-            {[
-              { name: 'Asian Paints Primer 1L', stock: '2 Case (24 pcs)', min: '48 pcs', supplier: 'Asian Paints Salem Depot' },
-              { name: 'Tata Tiscon 12mm TMT Bar', stock: '85 Rods (905 kg)', min: '1,000 kg', supplier: 'Salem Steel Suppliers' },
-              { name: 'Ashirvad CPVC Elbow 1"', stock: '12 piece', min: '50 piece', supplier: 'Ashirvad Southern Depot' },
-            ].map((item, idx) => (
-              <div key={idx} className="p-3 rounded-xl bg-slate-900 border border-slate-700/70 text-xs space-y-1.5">
+            {lowStockItems.length === 0 && (
+              <div className="text-center p-6 text-slate-500 text-xs">No items below minimum stock.</div>
+            )}
+            {lowStockItems.map((item) => (
+              <div key={item.product_id} className="p-3 rounded-xl bg-slate-900 border border-slate-700/70 text-xs space-y-1.5">
                 <div className="flex justify-between font-bold text-white">
-                  <span>{item.name}</span>
-                  <span className="text-red-400 font-mono font-black">{item.stock}</span>
+                  <span>{item.product_name}</span>
+                  <span className="text-red-400 font-mono font-black">{item.display_stock}</span>
                 </div>
                 <div className="flex justify-between text-[11px] text-slate-400">
-                  <span>Threshold: <strong className="text-slate-200">{item.min}</strong></span>
-                  <span className="text-slate-300 truncate max-w-[180px]">Supplier: {item.supplier}</span>
+                  <span>Threshold: <strong className="text-slate-200">{item.min_stock_base} {item.base_unit}</strong></span>
+                  <span className="text-slate-300 truncate max-w-[180px]">Reorder: {item.display_suggested_reorder}</span>
                 </div>
               </div>
             ))}

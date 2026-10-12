@@ -29,3 +29,31 @@ input:focus, select:focus, button:focus {
   border: 1px solid #334155;
   box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
 }
+
+/* Print optimization for thermal receipts */
+@media print {
+  body {
+    background-color: white !important;
+    color: black !important;
+  }
+  body * {
+    visibility: hidden;
+  }
+  #thermal-receipt-printable, #thermal-receipt-printable * {
+    visibility: visible;
+  }
+  #thermal-receipt-printable {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 80mm !important;
+    max-width: 100% !important;
+    max-height: none !important;
+    overflow: visible !important;
+    margin: 0 !important;
+    padding: 2mm !important;
+    background: white !important;
+    color: black !important;
+  }
+}
+

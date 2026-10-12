@@ -9,6 +9,7 @@ import uuid
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.timeutils import today_ist
 from app.models.tenant import Tenant, NumberSeries
 from app.models.ledger import Party, LedgerEntry, PaymentAllocation, CollectionReminderLog
 from app.modules.billing.thermal_printer import ThermalReceiptGenerator
@@ -28,6 +29,24 @@ from app.schemas.ledger import (
 )
 
 TWO_PLACES = Decimal("0.01")
+
+# Supplier-side documents never count as customer receivables (matters for party_type 'BOTH')
+SUPPLIER_ENTRY_TYPES = ("SUPPLIER_PAYMENT", "PURCHASE_BILL")
+
+
+def default_side(party: Party) -> str:
+    """Receivable (customer bills) unless the party is a pure supplier."""
+    return "PAYABLE" if party.party_type == "SUPPLIER" else "RECEIVABLE"
+
+
+def _bucket(age_days: int) -> str:
+    if age_days <= 30:
+        return "0-30"
+    if age_days <= 60:
+        return "31-60"
+    if age_days <= 90:
+        return "61-90"
+    return "90+"
 
 
 class LedgerService:
@@ -93,7 +112,7 @@ class LedgerService:
             default_prefix="REC/26-27/",
         )
 
-        voucher_date = payload.voucher_date or date.today()
+        voucher_date = payload.voucher_date or today_ist()
         receipt_entry_id = str(uuid.uuid4())
 
         # 1. Post Credit Ledger Entry (strictly append-only)
@@ -108,7 +127,12 @@ class LedgerService:
             reference_doc_id=receipt_entry_id,
             reference_doc_number=voucher_number,
             entry_date=voucher_date,
-            notes=payload.notes or f"Payment receipt #{voucher_number} via {payload.payment_mode}",
+            # Payment mode is always recorded in notes ("via CASH") - cash reconciliation relies on it
+            notes=(
+                f"{payload.notes} (via {payload.payment_mode.upper()})"
+                if payload.notes
+                else f"Payment receipt #{voucher_number} via {payload.payment_mode.upper()}"
+            ),
         )
         session.add(receipt_entry)
 
@@ -124,6 +148,7 @@ class LedgerService:
                     LedgerEntry.tenant_id == tenant_id,
                     LedgerEntry.party_id == party.id,
                     LedgerEntry.debit_amount > 0,
+                    LedgerEntry.entry_type.not_in(SUPPLIER_ENTRY_TYPES),
                 )
                 .order_by(LedgerEntry.entry_date.asc(), LedgerEntry.created_at.asc())
             )
@@ -259,7 +284,7 @@ class LedgerService:
             default_prefix="PAY/26-27/",
         )
 
-        voucher_date = payload.payment_date or date.today()
+        voucher_date = payload.payment_date or today_ist()
         entry_id = str(uuid.uuid4())
 
         # Post Debit Ledger Entry (paying supplier debits their account, reducing negative balance)
@@ -274,7 +299,11 @@ class LedgerService:
             reference_doc_id=entry_id,
             reference_doc_number=voucher_number,
             entry_date=voucher_date,
-            notes=payload.notes or f"Supplier payment #{voucher_number} via {payload.payment_mode}",
+            notes=(
+                f"{payload.notes} (via {payload.payment_mode.upper()})"
+                if payload.notes
+                else f"Supplier payment #{voucher_number} via {payload.payment_mode.upper()}"
+            ),
         )
         session.add(debit_entry)
 
@@ -305,10 +334,16 @@ class LedgerService:
         tenant_id: str,
         party_id: str,
         as_of_date: Optional[date] = None,
+        side: Optional[str] = None,
     ) -> List[InvoiceDueItemSchema]:
-        """Fetch all unpaid or partially paid debit invoices with days overdue and ageing buckets."""
+        """Fetch all unpaid or partially paid bills with days overdue and ageing buckets.
+
+        side='RECEIVABLE' (default for customers): sales-side debit entries, settled via PaymentAllocation.
+        side='PAYABLE' (default for suppliers): purchase bills / credit opening balances, settled by
+        supplier payments (debits) applied oldest bill first.
+        """
         if not as_of_date:
-            as_of_date = date.today()
+            as_of_date = today_ist()
 
         party = await session.scalar(
             select(Party).where(Party.id == party_id, Party.tenant_id == tenant_id)
@@ -316,14 +351,18 @@ class LedgerService:
         if not party:
             raise ValueError(f"Party {party_id} not found")
 
+        if (side or default_side(party)) == "PAYABLE":
+            return await LedgerService._get_supplier_open_bills(session, tenant_id, party, as_of_date)
+
         debit_stmt = (
             select(LedgerEntry)
             .where(
                 LedgerEntry.tenant_id == tenant_id,
                 LedgerEntry.party_id == party_id,
                 LedgerEntry.debit_amount > 0,
+                LedgerEntry.entry_type.not_in(SUPPLIER_ENTRY_TYPES),
             )
-            .order_by(LedgerEntry.entry_date.asc())
+            .order_by(LedgerEntry.entry_date.asc(), LedgerEntry.created_at.asc())
         )
         debit_entries = (await session.execute(debit_stmt)).scalars().all()
 
@@ -368,15 +407,83 @@ class LedgerService:
         return results
 
     @staticmethod
+    async def _supplier_payable_totals(
+        session: AsyncSession, tenant_id: str, party: Party
+    ) -> Tuple[List[LedgerEntry], Decimal]:
+        """Supplier bills (credit entries, oldest first) and the total paid to the supplier (debits).
+
+        For a 'BOTH' party only supplier documents count (its customer-side entries are receivables).
+        """
+        bill_filters = [
+            LedgerEntry.tenant_id == tenant_id,
+            LedgerEntry.party_id == party.id,
+            LedgerEntry.credit_amount > 0,
+        ]
+        paid_filters = [
+            LedgerEntry.tenant_id == tenant_id,
+            LedgerEntry.party_id == party.id,
+            LedgerEntry.debit_amount > 0,
+        ]
+        if party.party_type == "BOTH":
+            bill_filters.append(LedgerEntry.entry_type == "PURCHASE_BILL")
+            paid_filters.append(LedgerEntry.entry_type == "SUPPLIER_PAYMENT")
+        bills = (
+            await session.execute(
+                select(LedgerEntry)
+                .where(*bill_filters)
+                .order_by(LedgerEntry.entry_date.asc(), LedgerEntry.created_at.asc())
+            )
+        ).scalars().all()
+        total_paid = await session.scalar(
+            select(func.coalesce(func.sum(LedgerEntry.debit_amount), Decimal("0"))).where(*paid_filters)
+        ) or Decimal("0.00")
+        return list(bills), Decimal(total_paid)
+
+    @staticmethod
+    async def _get_supplier_open_bills(
+        session: AsyncSession,
+        tenant_id: str,
+        party: Party,
+        as_of_date: date,
+    ) -> List[InvoiceDueItemSchema]:
+        """Open purchase bills for a supplier: payments settle the oldest bills first (FIFO)."""
+        bills, total_paid = await LedgerService._supplier_payable_totals(session, tenant_id, party)
+        remaining_paid = total_paid
+        results: List[InvoiceDueItemSchema] = []
+        for bill in bills:
+            settled = min(remaining_paid, bill.credit_amount)
+            remaining_paid -= settled
+            due_amt = (bill.credit_amount - settled).quantize(TWO_PLACES)
+            if due_amt <= Decimal("0.00"):
+                continue
+            age_days = (as_of_date - bill.entry_date).days
+            results.append(
+                InvoiceDueItemSchema(
+                    entry_id=bill.id,
+                    doc_type=bill.entry_type,
+                    doc_number=bill.reference_doc_number,
+                    doc_date=bill.entry_date,
+                    total_amount=bill.credit_amount,
+                    allocated_amount=settled.quantize(TWO_PLACES),
+                    due_amount=due_amt,
+                    age_days=age_days,
+                    bucket=_bucket(age_days),
+                    is_overdue=age_days > party.credit_days,
+                )
+            )
+        return results
+
+    @staticmethod
     async def get_party_ageing_summary(
         session: AsyncSession,
         tenant_id: str,
         party_id: str,
         as_of_date: Optional[date] = None,
+        side: Optional[str] = None,
     ) -> PartyAgeingSummarySchema:
         """Calculate complete ageing buckets, overdue totals, and credit limit compliance."""
         if not as_of_date:
-            as_of_date = date.today()
+            as_of_date = today_ist()
 
         party = await session.scalar(
             select(Party).where(Party.id == party_id, Party.tenant_id == tenant_id)
@@ -384,11 +491,13 @@ class LedgerService:
         if not party:
             raise ValueError(f"Party {party_id} not found")
 
+        side = side or default_side(party)
         open_dues = await LedgerService.get_party_open_dues(
             session=session,
             tenant_id=tenant_id,
             party_id=party_id,
             as_of_date=as_of_date,
+            side=side,
         )
 
         b_0_30 = Decimal("0.00")
@@ -410,12 +519,35 @@ class LedgerService:
             if item.is_overdue:
                 total_overdue += item.due_amount
 
+        if side == "PAYABLE":
+            bills, total_paid = await LedgerService._supplier_payable_totals(session, tenant_id, party)
+            total_billed = sum((b.credit_amount for b in bills), Decimal("0.00"))
+            return PartyAgeingSummarySchema(
+                party_id=party.id,
+                party_name=party.name,
+                phone=party.phone,
+                side="PAYABLE",
+                credit_limit=party.credit_limit,
+                credit_days=party.credit_days,
+                current_balance=party.current_balance,
+                is_credit_exceeded=False,
+                bucket_0_30=b_0_30,
+                bucket_31_60=b_31_60,
+                bucket_61_90=b_61_90,
+                bucket_90_plus=b_90_plus,
+                total_overdue=total_overdue,
+                # Paid to the supplier beyond all bills = advance with the supplier
+                unallocated_advance=max(Decimal("0.00"), total_paid - total_billed).quantize(TWO_PLACES),
+                open_invoices=open_dues,
+            )
+
         # Compute unallocated advances for this party
         total_credits = await session.scalar(
             select(func.coalesce(func.sum(LedgerEntry.credit_amount), Decimal("0"))).where(
                 LedgerEntry.tenant_id == tenant_id,
                 LedgerEntry.party_id == party_id,
                 LedgerEntry.credit_amount > 0,
+                LedgerEntry.entry_type.not_in(SUPPLIER_ENTRY_TYPES),
             )
         ) or Decimal("0.00")
 
@@ -424,6 +556,7 @@ class LedgerService:
             LedgerEntry.tenant_id == tenant_id,
             LedgerEntry.party_id == party_id,
             LedgerEntry.credit_amount > 0,
+            LedgerEntry.entry_type.not_in(SUPPLIER_ENTRY_TYPES),
         )
         total_allocated = await session.scalar(
             select(func.coalesce(func.sum(PaymentAllocation.allocated_amount), Decimal("0"))).where(
@@ -439,6 +572,7 @@ class LedgerService:
             party_id=party.id,
             party_name=party.name,
             phone=party.phone,
+            side="RECEIVABLE",
             credit_limit=party.credit_limit,
             credit_days=party.credit_days,
             current_balance=party.current_balance,
@@ -554,7 +688,7 @@ class LedgerService:
         parties = (await session.execute(stmt)).scalars().all()
 
         reminders: List[CollectionReminderItemSchema] = []
-        today = date.today()
+        today = today_ist()
 
         for p in parties:
             open_dues = await LedgerService.get_party_open_dues(
@@ -564,18 +698,21 @@ class LedgerService:
                 as_of_date=today,
             )
 
-            if not open_dues:
-                continue
+            overdue_bills = [inv for inv in open_dues if inv.is_overdue]
+            if not overdue_bills:
+                continue  # nothing is past its credit period yet: not on the call list
 
-            # Identify oldest bill and overdue amount
-            oldest_inv = open_dues[0]  # sorted by date ASC
-            oldest_age = oldest_inv.age_days
-            days_overdue = max(0, oldest_age - p.credit_days)
+            # Oldest overdue bill (dues are sorted by date ASC) and the amount actually overdue,
+            # net of any unallocated advance (never more than what the party owes overall)
+            oldest_inv = overdue_bills[0]
+            days_overdue = max(0, oldest_inv.age_days - p.credit_days)
 
-            overdue_amount = sum((inv.due_amount for inv in open_dues if inv.is_overdue), Decimal("0.00"))
+            overdue_amount = min(
+                sum((inv.due_amount for inv in overdue_bills), Decimal("0.00")),
+                p.current_balance,
+            ).quantize(TWO_PLACES)
             if overdue_amount <= Decimal("0.00"):
-                # If no bill strictly exceeds credit_days, check total balance vs min_amount
-                overdue_amount = p.current_balance
+                continue
 
             if days_overdue < min_days_overdue:
                 continue

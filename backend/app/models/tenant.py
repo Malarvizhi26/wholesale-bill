@@ -27,6 +27,8 @@ class Tenant(Base):
     pincode: Mapped[str] = mapped_column(String(10), nullable=False)
     currency: Mapped[str] = mapped_column(String(5), default="INR", nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # PBKDF2 hash of the owner's supervisor PIN (credit-limit / floor-price overrides). Never the raw PIN.
+    owner_pin_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 

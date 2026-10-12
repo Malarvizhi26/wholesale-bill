@@ -1,17 +1,19 @@
 """Inventory API endpoints: Products, Units, Purchases, Adjustments, Godowns, Alerts, and Pricing."""
 
 from decimal import Decimal
-from typing import List, Optional
+from typing import Dict, List, Optional
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.rls_session import get_tenant_db_session, get_current_tenant_id
-from app.models.catalogue import Product, ProductUnit, ProductPrice
+from app.models.catalogue import Product, ProductUnit, ProductPrice, PriceList
 from app.models.stock import Godown, PurchaseBill, StockAdjustment, StockBalance
-from app.schemas.product import ProductCreateSchema, ProductResponseSchema
+from app.schemas.product import ProductCreateSchema, ProductResponseSchema, PriceListResponseSchema
+from app.modules.inventory.excel_import import CatalogueImportEngine, ImportResultSchema
 from app.schemas.inventory import (
     GodownCreateSchema,
     GodownResponseSchema,
@@ -31,6 +33,17 @@ from app.modules.inventory.unit_converter import SmartUnitConverter, UnitDefinit
 
 router = APIRouter(prefix="/inventory", tags=["Inventory"])
 
+MAX_IMPORT_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _product_response(product: Product, stock_base: Decimal) -> ProductResponseSchema:
+    resp = ProductResponseSchema.model_validate(product, from_attributes=True)
+    resp.current_stock_base = stock_base
+    resp.display_stock = SmartUnitConverter.to_display_units(
+        stock_base, product.base_unit, get_product_unit_defs(product)
+    )
+    return resp
+
 
 # =============================================================================
 # 1. Products & Units
@@ -39,9 +52,10 @@ router = APIRouter(prefix="/inventory", tags=["Inventory"])
 @router.get("/products", response_model=List[ProductResponseSchema])
 async def list_products(
     search: Optional[str] = Query(None, description="Search by name, Tamil name, or code"),
+    godown_id: Optional[str] = Query(None, description="Stock for one godown (default: all godowns)"),
     session: AsyncSession = Depends(get_tenant_db_session),
 ):
-    """List catalogue products for current tenant."""
+    """List catalogue products for current tenant, with current stock (base units + display)."""
     tenant_id = get_current_tenant_id()
     query = (
         select(Product)
@@ -57,8 +71,19 @@ async def list_products(
             | (Product.code.ilike(search_filter))
         )
 
-    result = await session.execute(query)
-    return result.scalars().all()
+    products = (await session.execute(query)).scalars().all()
+
+    stock_q = (
+        select(StockBalance.product_id, func.sum(StockBalance.current_quantity_base))
+        .where(StockBalance.tenant_id == tenant_id)
+        .group_by(StockBalance.product_id)
+    )
+    if godown_id:
+        stock_q = stock_q.where(StockBalance.godown_id == godown_id)
+    stock_by_product: Dict[str, Decimal] = {
+        pid: Decimal(str(qty or 0)).quantize(Decimal("0.0001")) for pid, qty in (await session.execute(stock_q)).all()
+    }
+    return [_product_response(p, stock_by_product.get(p.id, Decimal("0.0000"))) for p in products]
 
 
 @router.post("/products", response_model=ProductResponseSchema, status_code=status.HTTP_201_CREATED)
@@ -69,6 +94,12 @@ async def create_product(
     """Create a new product with packaging units."""
     tenant_id = get_current_tenant_id()
     product_id = str(uuid.uuid4())
+
+    existing_code = await session.scalar(
+        select(Product.id).where(Product.tenant_id == tenant_id, Product.code == payload.code)
+    )
+    if existing_code:
+        raise HTTPException(status_code=400, detail=f"Product code '{payload.code}' already exists")
 
     product = Product(
         id=product_id,
@@ -84,6 +115,7 @@ async def create_product(
         min_stock_base=payload.min_stock_base,
         reorder_quantity_base=payload.reorder_quantity_base,
         purchase_price_base=payload.purchase_price_base,
+        gst_rate_percent=payload.gst_rate_percent,
     )
     session.add(product)
 
@@ -150,7 +182,62 @@ async def create_product(
 
     await session.commit()
     await session.refresh(product)
-    return product
+    return _product_response(product, Decimal("0.0000"))
+
+
+@router.get("/price-lists", response_model=List[PriceListResponseSchema])
+async def list_price_lists(
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Price lists (Retail / Wholesale / Contractor ...) configured for the tenant."""
+    tenant_id = get_current_tenant_id()
+    result = await session.execute(
+        select(PriceList).where(PriceList.tenant_id == tenant_id).order_by(PriceList.is_default.desc(), PriceList.name)
+    )
+    return result.scalars().all()
+
+
+@router.post("/import", response_model=ImportResultSchema)
+async def import_catalogue(
+    file: UploadFile = File(..., description="Catalogue sheet (.xlsx or .csv, max 5 MB)"),
+    dry_run: bool = Query(False, description="Validate and report only; write nothing"),
+    session: AsyncSession = Depends(get_tenant_db_session),
+):
+    """Bulk import products, packing units, tier prices and opening stock from Excel / CSV.
+
+    Valid rows are committed (unless dry_run); invalid rows are reported per row and skipped.
+    """
+    tenant_id = get_current_tenant_id()
+    filename = (file.filename or "").strip()
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if ext not in ("xlsx", "csv"):
+        raise HTTPException(status_code=415, detail="Unsupported file type. Upload a .xlsx or .csv file.")
+
+    content = await file.read(MAX_IMPORT_BYTES + 1)
+    if len(content) > MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="File too large (max 5 MB).")
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        if ext == "xlsx":
+            valid_rows, errors = CatalogueImportEngine.parse_xlsx_bytes(content)
+        else:
+            valid_rows, errors = CatalogueImportEngine.parse_csv_bytes(content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        return await CatalogueImportEngine.import_rows(
+            tenant_id=tenant_id,
+            file_name=filename,
+            valid_rows=valid_rows,
+            errors=errors,
+            session=session,
+            dry_run=dry_run,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/products/{product_id}/unit-display")
@@ -347,6 +434,12 @@ async def record_purchase_bill(
         return await InventoryService.process_purchase_bill(session, tenant_id, payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Purchase bill {payload.supplier_invoice_number} conflicts with an existing bill",
+        )
 
 
 @router.get("/purchases/{purchase_id}", response_model=PurchaseBillResponseSchema)

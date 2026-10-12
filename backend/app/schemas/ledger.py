@@ -25,6 +25,21 @@ class PartyCreateSchema(BaseModel):
     opening_balance: Decimal = Field(default=Decimal("0.00"))
 
 
+class PartyUpdateSchema(BaseModel):
+    party_type: Optional[str] = Field(None, description="CUSTOMER, SUPPLIER, or BOTH")
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    phone: Optional[str] = Field(None, max_length=15)
+    email: Optional[str] = Field(None, max_length=100)
+    gstin: Optional[str] = Field(None, max_length=15)
+    state_code: Optional[str] = Field(None, min_length=2, max_length=2)
+    billing_address: Optional[str] = None
+    price_list_code: Optional[str] = Field(None, description="RETAIL, CONTRACTOR, or WHOLESALE")
+    price_list_id: Optional[str] = None
+    credit_limit: Optional[Decimal] = Field(None, ge=0)
+    credit_days: Optional[int] = Field(None, ge=0)
+    is_active: Optional[bool] = None
+
+
 class PartyResponseSchema(BaseModel):
     id: str
     party_type: str
@@ -35,6 +50,8 @@ class PartyResponseSchema(BaseModel):
     state_code: str
     billing_address: Optional[str] = None
     price_list_id: Optional[str] = None
+    price_list_code: Optional[str] = None  # e.g. 'CONTRACTOR' (resolved from price_list_id)
+    price_list_name: Optional[str] = None
     credit_limit: Decimal
     credit_days: int
     opening_balance: Decimal
@@ -140,6 +157,7 @@ class PartyAgeingSummarySchema(BaseModel):
     party_id: str
     party_name: str
     phone: Optional[str] = None
+    side: str = "RECEIVABLE"  # 'RECEIVABLE' (customer bills) or 'PAYABLE' (supplier purchase bills)
     credit_limit: Decimal
     credit_days: int
     current_balance: Decimal

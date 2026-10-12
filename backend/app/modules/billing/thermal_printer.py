@@ -122,8 +122,7 @@ class ThermalReceiptGenerator:
         # 4. Totals & GST Summary
         lines.append(row("Taxable Subtotal:", f"Rs. {invoice.subtotal_taxable:.2f}"))
         if not invoice.is_inter_state:
-            lines.append(row("CGST Total:", f"Rs. {invoice.cgst_total:.2f}"))
-            lines.append(row("SGST Total:", f"Rs. {invoice.sgst_total:.2f}"))
+            lines.append(row("GST Total:", f"Rs. {invoice.tax_total:.2f}"))
         else:
             lines.append(row("IGST Total:", f"Rs. {invoice.igst_total:.2f}"))
 

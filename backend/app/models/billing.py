@@ -3,7 +3,7 @@
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import TenantScopedModel, utc_now
@@ -134,6 +134,9 @@ class SalesReturnLine(TenantScopedModel):
     gst_rate_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=Decimal("0.00"), nullable=False)
     tax_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"), nullable=False)
     line_total: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    return_condition: Mapped[str] = mapped_column(
+        String(20), default="EXCESS", server_default="EXCESS", nullable=False
+    )  # 'EXCESS' (good condition, restocked) or 'DAMAGED' (defective, not restocked)
 
     return_doc: Mapped["SalesReturn"] = relationship("SalesReturn", back_populates="lines")
 

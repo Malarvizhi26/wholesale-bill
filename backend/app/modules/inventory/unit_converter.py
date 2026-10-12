@@ -27,6 +27,19 @@ class UnitDefinition(BaseModel):
 
 class SmartUnitConverter:
     @staticmethod
+    def resolve_conversion_factor(units, unit_name: str, fallback: Decimal) -> Decimal:
+        """Return the catalogue conversion factor for unit_name (case-insensitive).
+
+        The product master is authoritative: a client-supplied factor is only used
+        when the unit is not defined on the product.
+        """
+        wanted = (unit_name or "").strip().lower()
+        for u in units or []:
+            if u.unit_name.strip().lower() == wanted:
+                return Decimal(u.conversion_factor)
+        return fallback
+
+    @staticmethod
     def to_base_quantity(
         quantity: Decimal,
         unit: UnitDefinition,

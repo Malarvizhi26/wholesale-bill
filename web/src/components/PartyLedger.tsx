@@ -17,11 +17,13 @@ import {
   Building2,
   RefreshCw,
   Search,
+  Pencil,
 } from 'lucide-react';
 import type {
   Party,
   Language,
   PartyCreateInput,
+  PartyUpdateInput,
   PartyAgeingSummary,
   InvoiceDueItem,
   SupplierBalancesSummary,
@@ -36,9 +38,12 @@ interface PartyLedgerProps {
   parties: Party[];
   language: Language;
   onAddParty?: (data: PartyCreateInput) => Promise<Party>;
+  onUpdateParty?: (partyId: string, data: PartyUpdateInput) => Promise<Party>;
+  initialTab?: string;
+  initialPartyId?: string;
 }
 
-export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialParties, language, onAddParty }) => {
+export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialParties, language, onAddParty, onUpdateParty, initialTab: _initialTab, initialPartyId: _initialPartyId }) => {
   const [partiesList, setPartiesList] = useState<Party[]>(initialParties);
   const [activeTab, setActiveTab] = useState<'CUSTOMERS' | 'SUPPLIERS' | 'CALL_LIST'>('CUSTOMERS');
   const [searchQuery, setSearchQuery] = useState('');
@@ -104,9 +109,103 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
     billingAddress: '',
   });
 
+  // Edit party modal state
+  const [editingParty, setEditingParty] = useState<Party | null>(null);
+  const [isSubmittingEdit, setIsSubmittingEdit] = useState(false);
+  const [editSuccessMsg, setEditSuccessMsg] = useState<string | null>(null);
+  const [editFormData, setEditFormData] = useState<{
+    name: string;
+    phone: string;
+    email: string;
+    gstin: string;
+    partyType: 'CUSTOMER' | 'SUPPLIER' | 'BOTH';
+    priceListCode: 'RETAIL' | 'CONTRACTOR' | 'WHOLESALE';
+    creditLimit: string;
+    creditDays: string;
+    billingAddress: string;
+  }>({
+    name: '',
+    phone: '',
+    email: '',
+    gstin: '',
+    partyType: 'CUSTOMER',
+    priceListCode: 'CONTRACTOR',
+    creditLimit: '25000',
+    creditDays: '30',
+    billingAddress: '',
+  });
+
+  const handleOpenEditParty = (party: Party) => {
+    setEditingParty(party);
+    setEditSuccessMsg(null);
+    setEditFormData({
+      name: party.name,
+      phone: party.phone || '',
+      email: party.email || '',
+      gstin: party.gstin || '',
+      partyType: party.party_type,
+      priceListCode: (party.price_list_code as any) || 'CONTRACTOR',
+      creditLimit: String(party.credit_limit ?? 0),
+      creditDays: String(party.credit_days ?? 30),
+      billingAddress: party.billing_address || '',
+    });
+  };
+
+  const handleSaveEditParty = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingParty || !editFormData.name.trim()) return;
+
+    setIsSubmittingEdit(true);
+    try {
+      const updatePayload: PartyUpdateInput = {
+        name: editFormData.name.trim(),
+        party_type: editFormData.partyType,
+        phone: editFormData.phone.trim() || undefined,
+        email: editFormData.email.trim() || undefined,
+        gstin: editFormData.gstin.trim() || undefined,
+        billing_address: editFormData.billingAddress.trim() || undefined,
+        price_list_code: editFormData.priceListCode,
+        credit_limit: parseFloat(editFormData.creditLimit) || 0,
+        credit_days: parseInt(editFormData.creditDays, 10) || 0,
+      };
+
+      let updatedParty: Party;
+      if (onUpdateParty) {
+        updatedParty = await onUpdateParty(editingParty.id, updatePayload);
+      } else {
+        updatedParty = await api.updateParty(editingParty.id, updatePayload);
+      }
+
+      setPartiesList(prev => prev.map(p => (p.id === updatedParty.id ? updatedParty : p)));
+      setEditSuccessMsg(language === 'ta' ? 'விவரங்கள் வெற்றிகரமாக மாற்றப்பட்டன!' : 'Party details updated successfully!');
+      setTimeout(() => {
+        setEditingParty(null);
+        setEditSuccessMsg(null);
+      }, 700);
+    } catch (err: any) {
+      alert(err.message || 'Failed to update party details');
+    } finally {
+      setIsSubmittingEdit(false);
+    }
+  };
+
   useEffect(() => {
     setPartiesList(initialParties);
   }, [initialParties]);
+
+  // Keyboard-first: Escape closes any open ledger dialog (same as the POS screen)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      setSelectedPartyForDues(null);
+      setSelectedPartyForPayment(null);
+      setSelectedSupplierForPayment(null);
+      setShowAddModal(false);
+      setEditingParty(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   // Load supplier summary when switching to suppliers tab
   const fetchSupplierSummary = async () => {
@@ -409,7 +508,7 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                             {isBreached ? (
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-bold bg-red-950/80 border border-red-700 text-red-300 animate-pulse">
                                 <AlertTriangle className="w-3 h-3 text-red-400" />
-                                Limit Breached (+₹{(p.current_balance - p.credit_limit).toLocaleString()})
+                                Limit Breached (+₹{(p.current_balance - p.credit_limit).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
                               </span>
                             ) : p.credit_limit > 0 ? (
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-950/60 border border-emerald-800 text-emerald-400">
@@ -433,6 +532,16 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                           </td>
                           <td className="p-3 text-center">
                             <div className="flex items-center justify-center gap-2">
+                              {/* Edit Customer Button */}
+                              <button
+                                onClick={() => handleOpenEditParty(p)}
+                                className="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition shadow-sm flex items-center gap-1"
+                                title={language === 'ta' ? 'வாடிக்கையாளர் விவரங்களை மாற்று' : 'Edit Customer Details'}
+                              >
+                                <Pencil className="w-3.5 h-3.5" />
+                                <span>{language === 'ta' ? 'மாற்று' : 'Edit'}</span>
+                              </button>
+
                               {/* Receive Payment Button */}
                               <button
                                 onClick={() => handleOpenReceivePayment(p)}
@@ -587,30 +696,42 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                             {s.last_transaction_date || '—'}
                           </td>
                           <td className="p-3 text-center">
-                            <button
-                              onClick={() => {
-                                setSelectedSupplierForPayment(
-                                  partyObj || {
-                                    id: s.supplier_id,
-                                    name: s.name,
-                                    party_type: 'SUPPLIER',
-                                    current_balance: s.current_balance,
-                                    credit_limit: 0,
-                                    credit_days: 0,
-                                    state_code: '33',
-                                  }
-                                );
-                                setSupplierPayAmount(s.net_payable > 0 ? String(s.net_payable) : '');
-                                setSupplierPayMode('NEFT_RTGS');
-                                setSupplierPayRef('');
-                                setSupplierPayNotes('');
-                                setSupplierPaySuccess(null);
-                              }}
-                              className="px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs transition shadow-sm flex items-center gap-1 mx-auto"
-                            >
-                              <ArrowUpRight className="w-3.5 h-3.5" />
-                              <span>Pay Supplier ₹</span>
-                            </button>
+                            <div className="flex items-center justify-center gap-2">
+                              {partyObj && (
+                                <button
+                                  onClick={() => handleOpenEditParty(partyObj)}
+                                  className="px-2.5 py-1 rounded-lg bg-blue-600/90 hover:bg-blue-500 text-white font-semibold text-xs transition shadow-sm flex items-center gap-1"
+                                  title={language === 'ta' ? 'சப்ளையர் விவரங்களை மாற்று' : 'Edit Supplier Details'}
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                  <span>{language === 'ta' ? 'மாற்று' : 'Edit'}</span>
+                                </button>
+                              )}
+                              <button
+                                onClick={() => {
+                                  setSelectedSupplierForPayment(
+                                    partyObj || {
+                                      id: s.supplier_id,
+                                      name: s.name,
+                                      party_type: 'SUPPLIER',
+                                      current_balance: s.current_balance,
+                                      credit_limit: 0,
+                                      credit_days: 0,
+                                      state_code: '33',
+                                    }
+                                  );
+                                  setSupplierPayAmount(s.net_payable > 0 ? String(s.net_payable) : '');
+                                  setSupplierPayMode('NEFT_RTGS');
+                                  setSupplierPayRef('');
+                                  setSupplierPayNotes('');
+                                  setSupplierPaySuccess(null);
+                                }}
+                                className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition shadow-sm flex items-center gap-1"
+                              >
+                                <ArrowUpRight className="w-3.5 h-3.5" />
+                                <span>Pay Supplier ₹</span>
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       );
@@ -690,7 +811,7 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                     <div className="grid grid-cols-3 gap-2 bg-slate-950/70 p-2.5 rounded-lg border border-slate-800 text-xs font-mono">
                       <div>
                         <div className="text-[10px] text-slate-400 uppercase">Total Balance</div>
-                        <div className="font-bold text-white">₹{item.current_balance.toLocaleString()}</div>
+                        <div className="font-bold text-white">₹{item.current_balance.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
                       </div>
                       <div>
                         <div className="text-[10px] text-slate-400 uppercase">Oldest Bill</div>
@@ -820,15 +941,15 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                 <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 flex items-center justify-between text-xs font-mono">
                   <div>
                     <span className="text-slate-400">Total Overdue:</span>{' '}
-                    <span className="text-red-400 font-bold">₹{duesSummary.total_overdue.toLocaleString()}</span>
+                    <span className="text-red-400 font-bold">₹{duesSummary.total_overdue.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                   </div>
                   <div>
                     <span className="text-slate-400">Unallocated Advances:</span>{' '}
-                    <span className="text-emerald-400 font-bold">₹{duesSummary.unallocated_advance.toLocaleString()}</span>
+                    <span className="text-emerald-400 font-bold">₹{duesSummary.unallocated_advance.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                   </div>
                   <div>
                     <span className="text-slate-400">Current Balance:</span>{' '}
-                    <span className="text-white font-bold">₹{duesSummary.current_balance.toLocaleString()}</span>
+                    <span className="text-white font-bold">₹{duesSummary.current_balance.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                   </div>
                 </div>
 
@@ -858,9 +979,9 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                           <tr key={inv.entry_id} className="hover:bg-slate-800/30">
                             <td className="p-2.5 font-mono font-bold text-white">{inv.doc_number}</td>
                             <td className="p-2.5 font-mono text-slate-400">{inv.doc_date}</td>
-                            <td className="p-2.5 text-right font-mono">₹{inv.total_amount.toLocaleString()}</td>
-                            <td className="p-2.5 text-right font-mono text-emerald-400">₹{inv.allocated_amount.toLocaleString()}</td>
-                            <td className="p-2.5 text-right font-mono font-bold text-amber-300">₹{inv.due_amount.toLocaleString()}</td>
+                            <td className="p-2.5 text-right font-mono">₹{inv.total_amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                            <td className="p-2.5 text-right font-mono text-emerald-400">₹{inv.allocated_amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                            <td className="p-2.5 text-right font-mono font-bold text-amber-300">₹{inv.due_amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                             <td className="p-2.5 text-center font-mono">
                               <span className={inv.is_overdue ? 'text-red-400 font-bold' : 'text-slate-300'}>
                                 {inv.age_days}d
@@ -932,11 +1053,11 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                   <span>Voucher #{receiptSuccessData.voucher_number} Posted Successfully!</span>
                 </div>
                 <div className="space-y-1 text-slate-300 font-mono text-[11px]">
-                  <div>Total Received: ₹{receiptSuccessData.total_amount.toLocaleString()}</div>
-                  <div>Allocated to Invoices: ₹{receiptSuccessData.allocated_amount.toLocaleString()}</div>
-                  <div>Unallocated Advance: ₹{receiptSuccessData.unallocated_amount.toLocaleString()}</div>
+                  <div>Total Received: ₹{receiptSuccessData.total_amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                  <div>Allocated to Invoices: ₹{receiptSuccessData.allocated_amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                  <div>Unallocated Advance: ₹{receiptSuccessData.unallocated_amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
                   <div className="font-bold text-white border-t border-emerald-800 pt-1 mt-1">
-                    New Current Balance: ₹{receiptSuccessData.party_current_balance.toLocaleString()}
+                    New Current Balance: ₹{receiptSuccessData.party_current_balance.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </div>
                 </div>
 
@@ -946,7 +1067,7 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                     {receiptSuccessData.allocations.map(a => (
                       <div key={a.allocation_id} className="text-[11px] text-slate-300 font-mono flex justify-between">
                         <span>{a.invoice_number}</span>
-                        <span>₹{a.allocated_amount.toLocaleString()}</span>
+                        <span>₹{a.allocated_amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                       </div>
                     ))}
                   </div>
@@ -1124,10 +1245,10 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                   <span>Voucher #{supplierPaySuccess.voucher_number} Posted!</span>
                 </div>
                 <div className="space-y-1 text-slate-300 font-mono text-[11px]">
-                  <div>Amount Paid: ₹{supplierPaySuccess.amount.toLocaleString()}</div>
+                  <div>Amount Paid: ₹{supplierPaySuccess.amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
                   <div>Mode: {supplierPaySuccess.payment_mode}</div>
                   <div className="font-bold text-white border-t border-blue-800 pt-1 mt-1">
-                    New Net Balance: ₹{supplierPaySuccess.supplier_current_balance.toLocaleString()}
+                    New Net Balance: ₹{supplierPaySuccess.supplier_current_balance.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </div>
                 </div>
                 <button
@@ -1256,6 +1377,9 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                       state_code: '33',
                     });
                     setPartiesList(prev => [...prev, created]);
+                    // Supplier table & call list are server summaries: refresh them too
+                    if (activeTab === 'SUPPLIERS') fetchSupplierSummary();
+                    else if (activeTab === 'CALL_LIST') fetchCallList();
                   }
                   setAddSuccessMsg(
                     language === 'ta'
@@ -1266,6 +1390,8 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                     setShowAddModal(false);
                     setAddSuccessMsg(null);
                   }, 1000);
+                } catch (err: any) {
+                  alert(`Party not saved: ${err?.message || 'server error'}`);
                 } finally {
                   setIsSubmittingParty(false);
                 }
@@ -1434,6 +1560,191 @@ export const PartyLedger: React.FC<PartyLedgerProps> = ({ parties: initialPartie
                 >
                   <UserPlus className="w-3.5 h-3.5" />
                   <span>{isSubmittingParty ? 'Saving...' : (language === 'ta' ? 'கணக்கைச் சேமிக்கவும்' : 'Save Party')}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 5: EDIT PARTY (CUSTOMER / SUPPLIER) */}
+      {/* ========================================================================= */}
+      {editingParty && (
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full p-5 space-y-4 shadow-2xl animate-in fade-in duration-200">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-2">
+                <Pencil className="w-5 h-5 text-blue-400" />
+                <div>
+                  <h3 className="font-bold text-white text-base">
+                    {editingParty.party_type === 'SUPPLIER'
+                      ? (language === 'ta' ? 'சப்ளையர் விவரங்களை மாற்று' : 'Edit Supplier Details')
+                      : (language === 'ta' ? 'வாடிக்கையாளர் விவரங்களை மாற்று' : 'Edit Customer Details')}
+                  </h3>
+                  <div className="text-[11px] text-slate-400 font-mono">
+                    ID: {editingParty.id.slice(0, 8)} • Balance: ₹{Number(editingParty.current_balance ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={() => setEditingParty(null)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditParty} className="space-y-3.5">
+              {/* Name & Phone */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'பெயர் / நிறுவனம் *' : 'Party / Firm Name *'}
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={editFormData.name}
+                    onChange={e => setEditFormData(prev => ({ ...prev, name: e.target.value }))}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs focus:border-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'கைபேசி எண் (WhatsApp)' : 'Phone Number'}
+                  </label>
+                  <input
+                    type="tel"
+                    placeholder="94433 22110"
+                    value={editFormData.phone}
+                    onChange={e => setEditFormData(prev => ({ ...prev, phone: e.target.value }))}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-xs focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              {/* Party Type & Price Tier */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'வகை (Party Type)' : 'Party Type'}
+                  </label>
+                  <select
+                    value={editFormData.partyType}
+                    onChange={e => setEditFormData(prev => ({ ...prev, partyType: e.target.value as any }))}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs focus:border-blue-500"
+                  >
+                    <option value="CUSTOMER">Customer (வாடிக்கையாளர்)</option>
+                    <option value="SUPPLIER">Supplier (சப்ளையர்)</option>
+                    <option value="BOTH">Both (இருவரும்)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'விலைப் பட்டியல் (Price Tier)' : 'Price List Tier'}
+                  </label>
+                  <select
+                    value={editFormData.priceListCode}
+                    onChange={e => setEditFormData(prev => ({ ...prev, priceListCode: e.target.value as any }))}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs focus:border-blue-500"
+                  >
+                    <option value="CONTRACTOR">Contractor / Mason (ஒப்பந்ததாரர்)</option>
+                    <option value="RETAIL">Retail (சில்லறை)</option>
+                    <option value="WHOLESALE">Wholesale (மொத்த விற்பனை)</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* GSTIN & Email */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">GSTIN (B2B Tax Invoice)</label>
+                  <input
+                    type="text"
+                    maxLength={15}
+                    placeholder="33AABCM9876Q1Z2"
+                    value={editFormData.gstin}
+                    onChange={e => setEditFormData(prev => ({ ...prev, gstin: e.target.value.toUpperCase() }))}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono uppercase text-white text-xs focus:border-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">Email</label>
+                  <input
+                    type="email"
+                    placeholder="builder@example.com"
+                    value={editFormData.email}
+                    onChange={e => setEditFormData(prev => ({ ...prev, email: e.target.value }))}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              {/* Credit Limit & Days */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'கடன் வரம்பு (₹)' : 'Credit Limit (₹)'}
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="500"
+                    value={editFormData.creditLimit}
+                    onChange={e => setEditFormData(prev => ({ ...prev, creditLimit: e.target.value }))}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-xs focus:border-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-300 font-semibold block mb-1">
+                    {language === 'ta' ? 'கடன் நாட்கள்' : 'Credit Days'}
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    value={editFormData.creditDays}
+                    onChange={e => setEditFormData(prev => ({ ...prev, creditDays: e.target.value }))}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-white text-xs focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              {/* Address */}
+              <div>
+                <label className="text-xs text-slate-300 font-semibold block mb-1">
+                  {language === 'ta' ? 'முகவரி (Address)' : 'Billing Address'}
+                </label>
+                <textarea
+                  rows={2}
+                  placeholder="Street, Area, Town..."
+                  value={editFormData.billingAddress}
+                  onChange={e => setEditFormData(prev => ({ ...prev, billingAddress: e.target.value }))}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white text-xs focus:border-blue-500"
+                />
+              </div>
+
+              {editSuccessMsg && (
+                <div className="p-2.5 rounded-lg bg-emerald-950/80 border border-emerald-800 text-emerald-300 text-xs font-semibold">
+                  {editSuccessMsg}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setEditingParty(null)}
+                  className="px-3.5 py-2 rounded-lg bg-slate-800 text-slate-300 text-xs font-semibold hover:bg-slate-700 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmittingEdit}
+                  className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs font-bold transition shadow-md flex items-center gap-1.5"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                  <span>{isSubmittingEdit ? 'Saving...' : (language === 'ta' ? 'மாற்றங்களைச் சேமிக்கவும்' : 'Save Changes')}</span>
                 </button>
               </div>
             </form>

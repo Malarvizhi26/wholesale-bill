@@ -11,6 +11,7 @@ from app.models.stock import (
     PurchaseBillLine,
     StockAdjustment,
     StockAdjustmentLine,
+    StockAlert,
 )
 from app.models.ledger import Party, LedgerEntry, PaymentAllocation, CollectionReminderLog
 from app.models.billing import (
@@ -45,6 +46,7 @@ __all__ = [
     "PurchaseBillLine",
     "StockAdjustment",
     "StockAdjustmentLine",
+    "StockAlert",
     "Party",
     "LedgerEntry",
     "PaymentAllocation",

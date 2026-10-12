@@ -488,3 +488,66 @@ async def test_collection_reminders_and_whatsapp_dispatch():
         assert log is not None
         assert log.recipient_phone == "9842154321"
         assert "INV/26-27/0888" in log.message_text
+
+
+@pytest.mark.asyncio
+async def test_update_party_details():
+    """Verify updating customer/supplier details (name, phone, gstin, credit limit, price tier, etc.)."""
+    headers = {"X-Tenant-ID": DEMO_TENANT_ID}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        # 1. Create a customer
+        create_res = await ac.post(
+            "/api/v1/ledger/parties",
+            headers=headers,
+            json={
+                "party_type": "CUSTOMER",
+                "name": "Karthik Builders",
+                "phone": "9842199999",
+                "gstin": "33ABCDE1234F1Z5",
+                "price_list_code": "RETAIL",
+                "credit_limit": "20000.00",
+                "credit_days": 15,
+                "billing_address": "45 Main Road, Salem",
+            },
+        )
+        assert create_res.status_code == 201
+        p_id = create_res.json()["id"]
+
+        # 2. Fetch single party
+        get_res = await ac.get(f"/api/v1/ledger/parties/{p_id}", headers=headers)
+        assert get_res.status_code == 200
+        assert get_res.json()["name"] == "Karthik Builders"
+
+        # 3. Update customer details (change phone, upgrade to CONTRACTOR tier, increase credit limit, update address)
+        put_res = await ac.put(
+            f"/api/v1/ledger/parties/{p_id}",
+            headers=headers,
+            json={
+                "name": "Karthik Modern Builders",
+                "phone": "9842188888",
+                "gstin": "33ABCDE1234F2Z6",
+                "price_list_code": "CONTRACTOR",
+                "credit_limit": "50000.00",
+                "credit_days": 30,
+                "billing_address": "100 New Bypass Road, Salem",
+            },
+        )
+        assert put_res.status_code == 200
+        updated = put_res.json()
+        assert updated["name"] == "Karthik Modern Builders"
+        assert updated["phone"] == "9842188888"
+        assert updated["gstin"] == "33ABCDE1234F2Z6"
+        assert updated["price_list_code"] == "CONTRACTOR"
+        assert Decimal(str(updated["credit_limit"])) == Decimal("50000.00")
+        assert updated["credit_days"] == 30
+        assert updated["billing_address"] == "100 New Bypass Road, Salem"
+
+        # 4. 404 for unknown party
+        bad_res = await ac.put(
+            "/api/v1/ledger/parties/non-existent-id",
+            headers=headers,
+            json={"name": "Nobody"},
+        )
+        assert bad_res.status_code == 404
+

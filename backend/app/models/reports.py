@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy import Date, DateTime, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.timeutils import today_ist
 from app.models.base import TenantScopedModel, utc_now
 
 
@@ -14,7 +15,7 @@ class Expense(TenantScopedModel):
     __tablename__ = "expenses"
 
     voucher_number: Mapped[str] = mapped_column(String(60), nullable=False)
-    expense_date: Mapped[date] = mapped_column(Date, default=date.today, nullable=False)
+    expense_date: Mapped[date] = mapped_column(Date, default=today_ist, nullable=False)
     category: Mapped[str] = mapped_column(String(50), nullable=False)  # SHOP_RENT, ELECTRICITY, SALARY_WAGES, TEA_HAMALI, FREIGHT_OUTWARD, REPAIRS_MAINTENANCE, OFFICE_STATIONERY, MISC
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     payment_mode: Mapped[str] = mapped_column(String(20), default="CASH", nullable=False)  # CASH, UPI, NEFT_RTGS, CHEQUE
@@ -36,7 +37,7 @@ class CashDrawerSession(TenantScopedModel):
     device_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     counter_name: Mapped[str] = mapped_column(String(100), default="Counter 1", nullable=False)
     cashier_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    session_date: Mapped[date] = mapped_column(Date, default=date.today, nullable=False)
+    session_date: Mapped[date] = mapped_column(Date, default=today_ist, nullable=False)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="OPEN", nullable=False)  # OPEN, CLOSED, RECONCILED
@@ -44,6 +45,9 @@ class CashDrawerSession(TenantScopedModel):
     opening_cash: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"), nullable=False)
     cash_sales_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"), nullable=False)
     cash_ledger_receipts: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"), nullable=False)
+    cash_refunds_paid: Mapped[Decimal] = mapped_column(
+        Numeric(14, 2), default=Decimal("0.00"), server_default="0.00", nullable=False
+    )
     cash_expenses_paid: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"), nullable=False)
     cash_supplier_payouts: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"), nullable=False)
     expected_cash_drawer: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"), nullable=False)

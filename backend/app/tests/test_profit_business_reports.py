@@ -29,6 +29,17 @@ from app.models.reports import Expense
 DEMO_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
+async def _default_price_list_id(session) -> str:
+    """Real FK target (SQLite does not enforce foreign keys, PostgreSQL does)."""
+    from app.models.catalogue import PriceList
+    return await session.scalar(select(PriceList.id).where(PriceList.tenant_id == DEMO_TENANT_ID, PriceList.is_default.is_(True)))
+
+
+async def _primary_godown_id(session) -> str:
+    from app.models.stock import Godown
+    return await session.scalar(select(Godown.id).where(Godown.tenant_id == DEMO_TENANT_ID, Godown.is_primary.is_(True)))
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def setup_db():
     await init_db()
@@ -50,8 +61,8 @@ async def test_daily_sales_summary():
             invoice_date=datetime.now(timezone.utc),
             customer_name="Counter Cash Walk-in",
             place_of_supply_state_code="33",
-            price_list_id=str(uuid.uuid4()),
-            godown_id=str(uuid.uuid4()),
+            price_list_id=await _default_price_list_id(session),
+            godown_id=await _primary_godown_id(session),
             status="POSTED",
             subtotal_amount=Decimal("1000.00"),
             discount_amount=Decimal("0.00"),
@@ -71,8 +82,8 @@ async def test_daily_sales_summary():
             invoice_date=datetime.now(timezone.utc),
             customer_name="Ramesh Contractor",
             place_of_supply_state_code="33",
-            price_list_id=str(uuid.uuid4()),
-            godown_id=str(uuid.uuid4()),
+            price_list_id=await _default_price_list_id(session),
+            godown_id=await _primary_godown_id(session),
             status="POSTED",
             subtotal_amount=Decimal("2000.00"),
             discount_amount=Decimal("0.00"),
@@ -121,8 +132,8 @@ async def test_gross_margin_calculation():
             invoice_date=datetime.now(timezone.utc),
             customer_name="Test Margin Customer",
             place_of_supply_state_code="33",
-            price_list_id=str(uuid.uuid4()),
-            godown_id=str(uuid.uuid4()),
+            price_list_id=await _default_price_list_id(session),
+            godown_id=await _primary_godown_id(session),
             status="POSTED",
             subtotal_amount=Decimal("2000.00"),
             discount_amount=Decimal("0.00"),
@@ -273,6 +284,19 @@ async def test_stock_valuation_report():
     headers = {"X-Tenant-ID": DEMO_TENANT_ID}
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        # Make the test hermetic: put screw stock on hand instead of relying on earlier tests
+        godowns = (await ac.get("/api/v1/inventory/godowns", headers=headers)).json()
+        main_godown = next(g for g in godowns if g["code"] == "MAIN")
+        screw = (await ac.get("/api/v1/billing/search?q=SCR001", headers=headers)).json()[0]
+        pur = await ac.post("/api/v1/inventory/purchases", headers=headers, json={
+            "supplier_name": "Valuation Test Supplier",
+            "supplier_invoice_number": f"VAL-{uuid.uuid4().hex[:8]}",
+            "godown_id": main_godown["id"],
+            "lines": [{"product_id": screw["id"], "unit_name": "Box", "conversion_factor": 100,
+                       "quantity": 50, "unit_purchase_price": 140}],
+        })
+        assert pur.status_code == 201
+
         res = await ac.get("/api/v1/reports/stock/valuation", headers=headers)
         assert res.status_code == 200
         data = res.json()
@@ -304,8 +328,8 @@ async def test_cash_drawer_reconciliation():
             invoice_date=datetime.now(timezone.utc),
             customer_name="Cash Walk-in Counter",
             place_of_supply_state_code="33",
-            price_list_id=str(uuid.uuid4()),
-            godown_id=str(uuid.uuid4()),
+            price_list_id=await _default_price_list_id(session),
+            godown_id=await _primary_godown_id(session),
             status="POSTED",
             subtotal_amount=Decimal("1000.00"),
             discount_amount=Decimal("0.00"),

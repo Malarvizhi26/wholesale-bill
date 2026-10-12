@@ -174,6 +174,7 @@ class CashDrawerReconcileResponseSchema(BaseModel):
     opening_cash: Decimal
     cash_sales_amount: Decimal
     cash_ledger_receipts: Decimal
+    cash_refunds_paid: Decimal = Decimal("0.00")  # CASH refunds on sales returns that day
     cash_expenses_paid: Decimal
     cash_supplier_payouts: Decimal
     expected_cash_drawer: Decimal

@@ -5,7 +5,7 @@
   "scripts": {
     "web:dev": "npm --prefix web run dev",
     "web:build": "npm --prefix web run build",
-    "backend:dev": ".venv\\Scripts\\uvicorn app.main:app --app-dir backend --reload --port 8000",
+    "backend:dev": ".venv\\Scripts\\uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000",
     "backend:test": ".venv\\Scripts\\python -m pytest backend/app/tests -v"
   },
   "keywords": [

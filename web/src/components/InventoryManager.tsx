@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import type {
   Product,
+  Party,
   Language,
   Godown,
   GodownStockItem,
@@ -28,18 +29,23 @@ import type {
 } from '../types';
 import { CurrencyCell } from './ui/CurrencyCell';
 import { DecomposedUnitBadge } from './ui/DecomposedUnitBadge';
-import { api } from '../api/client';
+import { api, roundHalfUp } from '../api/client';
 
 interface InventoryManagerProps {
   products: Product[];
+  // Supplier parties: a purchase bill linked by supplier_id posts to the supplier ledger (payables)
+  parties?: Party[];
   language: Language;
+  initialTab?: string;
   onProductAdded?: (newProduct: Product) => void;
+  // Called after stock-changing postings so parent can re-fetch catalogue stock
+  onStockChanged?: () => void;
 }
 
 type TabType = 'catalogue' | 'purchases' | 'adjustments' | 'godowns' | 'alerts';
 
-export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, language, onProductAdded }) => {
-  const [activeTab, setActiveTab] = useState<TabType>('catalogue');
+export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, parties = [], language, initialTab, onProductAdded, onStockChanged }) => {
+  const [activeTab, setActiveTab] = useState<TabType>((initialTab as TabType) || 'catalogue');
   const [searchQuery, setSearchQuery] = useState('');
   const [showImportModal, setShowImportModal] = useState(false);
   const [csvContent, setCsvContent] = useState('');
@@ -123,6 +129,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
   const [selectedProductForHistory, setSelectedProductForHistory] = useState<Product | null>(null);
   const [priceHistoryData, setPriceHistoryData] = useState<ProductPriceHistory | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   // Load initial data
   useEffect(() => {
@@ -247,12 +254,9 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
   // Handlers
   const handleImportSubmit = () => {
     if (!csvContent.trim()) return;
-    setImportStatus('Catalogue import validated and committed successfully! 2 products updated.');
-    setTimeout(() => {
-      setShowImportModal(false);
-      setImportStatus(null);
-      setCsvContent('');
-    }, 1800);
+    // No bulk-import HTTP endpoint is exposed by the backend yet (excel_import.py is not routed),
+    // so nothing is saved here. Do not report a fake success.
+    setImportStatus('Error: bulk import is not available on the server yet - nothing was imported.');
   };
 
   const handleTransferSubmit = async (e: React.FormEvent) => {
@@ -270,6 +274,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
       setTransferStatus('Stock transferred successfully!');
       loadGodownStock(selectedGodownId);
       loadLowStockAlerts();
+      onStockChanged?.();
       setTimeout(() => setTransferStatus(null), 3000);
     } catch (err: any) {
       setTransferStatus(`Error: ${err.message}`);
@@ -279,48 +284,14 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
   const handleOpenPriceHistory = async (prod: Product) => {
     setSelectedProductForHistory(prod);
     setLoadingHistory(true);
+    setPriceHistoryData(null);
+    setHistoryError(null);
     try {
       const data = await api.getProductPriceHistory(prod.id);
       setPriceHistoryData(data);
-    } catch {
-      // Mock fallback if offline
-      setPriceHistoryData({
-        product_id: prod.id,
-        product_code: prod.code,
-        product_name: prod.name,
-        current_purchase_price_base: prod.purchase_price_base,
-        selling_price_history: [
-          {
-            price_list_id: 'pl-1',
-            price_list_code: 'RETAIL',
-            price_list_name: 'Retail (Walk-in)',
-            unit_name: prod.base_unit,
-            price: Number((prod.purchase_price_base * 1.25).toFixed(2)),
-            effective_from: new Date().toISOString(),
-            is_current: true,
-          },
-          {
-            price_list_id: 'pl-2',
-            price_list_code: 'CONTRACTOR',
-            price_list_name: 'Contractor / Mason',
-            unit_name: prod.base_unit,
-            price: Number((prod.purchase_price_base * 1.15).toFixed(2)),
-            effective_from: new Date().toISOString(),
-            is_current: true,
-          }
-        ],
-        purchase_cost_history: [
-          {
-            purchase_date: new Date().toISOString(),
-            supplier_name: 'Salem Steel Suppliers',
-            supplier_invoice_number: 'INV-2026-081',
-            unit_name: prod.base_unit,
-            quantity: 100,
-            unit_purchase_price: prod.purchase_price_base,
-            landed_cost_base: prod.purchase_price_base,
-          }
-        ]
-      });
+    } catch (err: any) {
+      // Show the real failure instead of an invented price timeline
+      setHistoryError(err?.message || 'Failed to load price history');
     } finally {
       setLoadingHistory(false);
     }
@@ -330,7 +301,11 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
     e.preventDefault();
     if (!purchaseSupplierName || !purchaseInvoiceNo || purchaseLines.length === 0) return;
     try {
+      const supplierParty = parties.find(p =>
+        (p.party_type === 'SUPPLIER' || p.party_type === 'BOTH') &&
+        p.name.trim().toLowerCase() === purchaseSupplierName.trim().toLowerCase());
       await api.createPurchase({
+        supplier_id: supplierParty?.id,
         supplier_name: purchaseSupplierName,
         supplier_invoice_number: purchaseInvoiceNo,
         godown_id: purchaseGodownId || godowns[0]?.id,
@@ -350,6 +325,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
       loadPurchases();
       loadGodownStock(selectedGodownId);
       loadLowStockAlerts();
+      onStockChanged?.();
       setTimeout(() => {
         setShowNewPurchaseModal(false);
         setPurchaseStatus(null);
@@ -380,6 +356,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
       loadAdjustments();
       loadGodownStock(selectedGodownId);
       loadLowStockAlerts();
+      onStockChanged?.();
       setTimeout(() => {
         setShowAdjustmentModal(false);
         setAdjStatus(null);
@@ -609,12 +586,14 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                 setShowNewPurchaseModal(true);
                 if (products.length > 0 && purchaseLines[0].product_id === '') {
                   const firstP = products[0];
+                  const buyUnit = firstP.units.find(u => u.is_default_purchase_unit) || firstP.units[0];
                   setPurchaseLines([{
                     product_id: firstP.id,
-                    unit_name: firstP.units[0]?.unit_name || firstP.base_unit,
-                    conversion_factor: firstP.units[0]?.conversion_factor || 1,
+                    unit_name: buyUnit?.unit_name || firstP.base_unit,
+                    conversion_factor: buyUnit?.conversion_factor || 1,
                     quantity: 10,
-                    unit_purchase_price: firstP.purchase_price_base,
+                    // purchase_price_base is per BASE unit; the line price is per purchase unit (e.g. per Box of 100)
+                    unit_purchase_price: roundHalfUp(firstP.purchase_price_base * (buyUnit?.conversion_factor || 1)),
                     discount_amount: 0,
                     gst_rate_percent: 18,
                   }]);
@@ -862,8 +841,13 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                       <input
                         type="number"
                         min="1"
-                        value={transferQty}
-                        onChange={(e) => setTransferQty(Number(e.target.value))}
+                        placeholder="1"
+                        value={transferQty === 0 ? '' : transferQty}
+                        onFocus={(e) => e.target.select()}
+                        onChange={(e) => {
+                          const val = e.target.value.replace(/^0+(?=\d)/, '');
+                          setTransferQty(val === '' ? 0 : Number(val));
+                        }}
                         className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white"
                       />
                     </div>
@@ -1044,6 +1028,8 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
 
             {loadingHistory ? (
               <div className="py-8 text-center text-slate-400 text-xs">Loading price timeline...</div>
+            ) : historyError ? (
+              <div className="py-8 text-center text-red-400 text-xs">{historyError}</div>
             ) : priceHistoryData ? (
               <div className="space-y-4 text-xs">
                 {/* Selling Price Lists */}
@@ -1158,10 +1144,16 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                     type="text"
                     required
                     placeholder="e.g. Coimbatore Steel Co"
+                    list="purchase-supplier-options"
                     value={purchaseSupplierName}
                     onChange={(e) => setPurchaseSupplierName(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white"
                   />
+                  <datalist id="purchase-supplier-options">
+                    {parties
+                      .filter(p => p.party_type === 'SUPPLIER' || p.party_type === 'BOTH')
+                      .map(p => <option key={p.id} value={p.name} />)}
+                  </datalist>
                 </div>
                 <div>
                   <label className="text-[10px] text-slate-400 block mb-1">Invoice Number:</label>
@@ -1188,22 +1180,34 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
 
               {/* Items Line */}
               <div className="border border-slate-800 rounded-xl p-3 bg-slate-950/60 space-y-2">
-                <div className="font-bold text-white text-xs mb-1">Bill Items & Landed Cost Inputs:</div>
+                <div className="flex items-center justify-between mb-1">
+                  <div className="font-bold text-white text-xs">Bill Items & Landed Cost Inputs:</div>
+                </div>
+
+                {/* Column Headers for Production/Clerk Clarity */}
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 text-[10px] font-semibold text-slate-400 px-1 pb-1">
+                  <div className="sm:col-span-2">Product / Item Name</div>
+                  <div>Quantity (Qty)</div>
+                  <div>Purchase Rate / Unit (₹)</div>
+                </div>
+
                 {purchaseLines.map((line, idx) => (
                     <div key={idx} className="grid grid-cols-1 sm:grid-cols-4 gap-2 items-center bg-slate-900 p-2 rounded-lg border border-slate-800">
                       <div className="sm:col-span-2">
+                        <label className="text-[9px] text-slate-400 block sm:hidden mb-0.5">Product / Item Name</label>
                         <select
                           value={line.product_id}
                           onChange={(e) => {
                             const pid = e.target.value;
                             const p = products.find(x => x.id === pid);
+                            const buyUnit = p?.units.find(u => u.is_default_purchase_unit) || p?.units[0];
                             const updated = [...purchaseLines];
                             updated[idx] = {
                               ...line,
                               product_id: pid,
-                              unit_name: p?.units[0]?.unit_name || p?.base_unit || 'piece',
-                              conversion_factor: p?.units[0]?.conversion_factor || 1,
-                              unit_purchase_price: p?.purchase_price_base || 0,
+                              unit_name: buyUnit?.unit_name || p?.base_unit || 'piece',
+                              conversion_factor: buyUnit?.conversion_factor || 1,
+                              unit_purchase_price: roundHalfUp((p?.purchase_price_base || 0) * (buyUnit?.conversion_factor || 1)),
                             };
                             setPurchaseLines(updated);
                           }}
@@ -1213,28 +1217,36 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                         </select>
                       </div>
                       <div>
+                        <label className="text-[9px] text-slate-400 block sm:hidden mb-0.5">Quantity (Qty)</label>
                         <input
                           type="number"
                           min="1"
-                          placeholder="Qty"
-                          value={line.quantity}
+                          placeholder="1"
+                          title="Quantity (Qty)"
+                          value={line.quantity === 0 ? '' : line.quantity}
+                          onFocus={(e) => e.target.select()}
                           onChange={(e) => {
+                            const val = e.target.value.replace(/^0+(?=\d)/, '');
                             const updated = [...purchaseLines];
-                            updated[idx].quantity = Number(e.target.value);
+                            updated[idx].quantity = val === '' ? 0 : Number(val);
                             setPurchaseLines(updated);
                           }}
                           className="w-full bg-slate-950 border border-slate-700 rounded p-1.5 text-white text-xs"
                         />
                       </div>
                       <div>
+                        <label className="text-[9px] text-slate-400 block sm:hidden mb-0.5">Purchase Rate / Unit (₹)</label>
                         <input
                           type="number"
                           step="0.01"
-                          placeholder="Price/unit"
-                          value={line.unit_purchase_price}
+                          placeholder="0.00"
+                          title="Purchase Rate / Unit (₹)"
+                          value={line.unit_purchase_price === 0 ? '' : line.unit_purchase_price}
+                          onFocus={(e) => e.target.select()}
                           onChange={(e) => {
+                            const val = e.target.value.replace(/^0+(?=\d)/, '');
                             const updated = [...purchaseLines];
-                            updated[idx].unit_purchase_price = Number(e.target.value);
+                            updated[idx].unit_purchase_price = val === '' ? 0 : Number(val);
                             setPurchaseLines(updated);
                           }}
                           className="w-full bg-slate-950 border border-slate-700 rounded p-1.5 text-white text-xs"
@@ -1251,8 +1263,13 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                   <input
                     type="number"
                     step="0.01"
-                    value={purchaseFreight}
-                    onChange={(e) => setPurchaseFreight(Number(e.target.value))}
+                    placeholder="0"
+                    value={purchaseFreight === 0 ? '' : purchaseFreight}
+                    onFocus={(e) => e.target.select()}
+                    onChange={(e) => {
+                      const val = e.target.value.replace(/^0+(?=\d)/, '');
+                      setPurchaseFreight(val === '' ? 0 : Number(val));
+                    }}
                     className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white"
                   />
                 </div>
@@ -1261,8 +1278,13 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                   <input
                     type="number"
                     step="0.01"
-                    value={purchaseLoading}
-                    onChange={(e) => setPurchaseLoading(Number(e.target.value))}
+                    placeholder="0"
+                    value={purchaseLoading === 0 ? '' : purchaseLoading}
+                    onFocus={(e) => e.target.select()}
+                    onChange={(e) => {
+                      const val = e.target.value.replace(/^0+(?=\d)/, '');
+                      setPurchaseLoading(val === '' ? 0 : Number(val));
+                    }}
                     className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white"
                   />
                 </div>
@@ -1374,8 +1396,13 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                   <label className="text-[10px] text-slate-400 block mb-1">Quantity (Negative = Loss):</label>
                   <input
                     type="number"
-                    value={adjQty}
-                    onChange={(e) => setAdjQty(Number(e.target.value))}
+                    placeholder="0"
+                    value={adjQty === 0 ? '' : adjQty}
+                    onFocus={(e) => e.target.select()}
+                    onChange={(e) => {
+                      const val = e.target.value.replace(/^0+(?=\d)/, '');
+                      setAdjQty(val === '' ? 0 : Number(val));
+                    }}
                     className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white font-mono"
                   />
                 </div>
@@ -1624,8 +1651,13 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                       step="0.01"
                       min="0"
                       required
-                      value={newPurchasePrice}
-                      onChange={(e) => setNewPurchasePrice(Number(e.target.value))}
+                      placeholder="0.00"
+                      value={newPurchasePrice === 0 ? '' : newPurchasePrice}
+                      onFocus={(e) => e.target.select()}
+                      onChange={(e) => {
+                        const val = e.target.value.replace(/^0+(?=\d)/, '');
+                        setNewPurchasePrice(val === '' ? 0 : Number(val));
+                      }}
                       className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-7 pr-3 py-2 text-white font-mono"
                     />
                   </div>
@@ -1660,8 +1692,13 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                       type="number"
                       step="0.01"
                       min="0"
-                      value={newMinStock}
-                      onChange={(e) => setNewMinStock(Number(e.target.value))}
+                      placeholder="0"
+                      value={newMinStock === 0 ? '' : newMinStock}
+                      onFocus={(e) => e.target.select()}
+                      onChange={(e) => {
+                        const val = e.target.value.replace(/^0+(?=\d)/, '');
+                        setNewMinStock(val === '' ? 0 : Number(val));
+                      }}
                       className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white font-mono"
                     />
                     <span className="text-slate-400 font-mono text-xs">{newBaseUnit}</span>
@@ -1677,8 +1714,13 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                       type="number"
                       step="0.01"
                       min="0"
-                      value={newReorderQty}
-                      onChange={(e) => setNewReorderQty(Number(e.target.value))}
+                      placeholder="0"
+                      value={newReorderQty === 0 ? '' : newReorderQty}
+                      onFocus={(e) => e.target.select()}
+                      onChange={(e) => {
+                        const val = e.target.value.replace(/^0+(?=\d)/, '');
+                        setNewReorderQty(val === '' ? 0 : Number(val));
+                      }}
                       className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white font-mono"
                     />
                     <span className="text-slate-400 font-mono text-xs">{newBaseUnit}</span>
@@ -1726,8 +1768,13 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ products, la
                         type="number"
                         step="0.0001"
                         min="1"
-                        value={newSecFactor}
-                        onChange={(e) => setNewSecFactor(Number(e.target.value))}
+                        placeholder="1"
+                        value={newSecFactor === 0 ? '' : newSecFactor}
+                        onFocus={(e) => e.target.select()}
+                        onChange={(e) => {
+                          const val = e.target.value.replace(/^0+(?=\d)/, '');
+                          setNewSecFactor(val === '' ? 0 : Number(val));
+                        }}
                         className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-white font-mono"
                       />
                     </div>

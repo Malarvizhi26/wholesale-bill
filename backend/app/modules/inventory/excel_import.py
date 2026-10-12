@@ -7,9 +7,10 @@ Per Module 2 of Development Plan:
 """
 
 import csv
+from datetime import datetime, timezone
 import io
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import uuid
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.catalogue import Brand, Category, PriceList, Product, ProductPrice, ProductUnit
 from app.models.stock import Godown, StockBalance, StockMovement
+from app.modules.inventory.unit_converter import SmartUnitConverter
 
 
 class ImportErrorItem(BaseModel):
@@ -42,6 +44,28 @@ class ParsedCatalogueRow(BaseModel):
     packing_unit: Optional[str] = None
     packing_factor: Optional[Decimal] = None
     opening_stock_base: Decimal = Decimal("0.0000")
+    gst_rate_percent: Decimal = Decimal("18.00")
+
+
+class ImportRowResult(BaseModel):
+    row_number: int
+    code: Optional[str] = None
+    status: str  # 'CREATED', 'UPDATED', 'VALID' (dry run), 'ERROR'
+    errors: List[ImportErrorItem] = []
+
+
+class ImportResultSchema(BaseModel):
+    file_name: str
+    dry_run: bool
+    committed: bool
+    total_rows: int
+    valid_rows_count: int
+    invalid_rows_count: int
+    products_created: int = 0
+    products_updated: int = 0
+    units_created: int = 0
+    prices_created: int = 0
+    rows: List[ImportRowResult]
 
 
 class ImportPreviewResult(BaseModel):
@@ -52,17 +76,74 @@ class ImportPreviewResult(BaseModel):
     sample_valid_rows: List[ParsedCatalogueRow]
 
 
+def _cell_text(value: Any) -> str:
+    """Normalise a CSV / Excel cell to text (Excel gives 7318.0 for a numeric HSN cell)."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "Y" if value else "N"
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else repr(value)
+    return str(value)
+
+
 class CatalogueImportEngine:
     VALID_BASE_UNITS = {"piece", "kg", "metre", "sqft", "litre"}
+    VALID_GST_RATES = {Decimal("0"), Decimal("5"), Decimal("12"), Decimal("18"), Decimal("28")}
+    MAX_ROWS = 10000
 
     @classmethod
     def parse_csv_stream(cls, text_content: str) -> Tuple[List[ParsedCatalogueRow], List[ImportErrorItem]]:
         """Parse raw CSV string into validated rows and error list."""
         reader = csv.DictReader(io.StringIO(text_content))
+        return cls.parse_records(enumerate(reader, start=2))  # row 1 is header
+
+    @classmethod
+    def parse_csv_bytes(cls, content: bytes) -> Tuple[List[ParsedCatalogueRow], List[ImportErrorItem]]:
+        try:
+            text_content = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise ValueError("CSV must be UTF-8 encoded (save as 'CSV UTF-8' in Excel)")
+        return cls.parse_csv_stream(text_content)
+
+    @classmethod
+    def parse_xlsx_bytes(cls, content: bytes) -> Tuple[List[ParsedCatalogueRow], List[ImportErrorItem]]:
+        """Parse the first worksheet of an .xlsx file; row 1 holds the column headers."""
+        from openpyxl import load_workbook
+
+        try:
+            wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        except Exception:
+            raise ValueError("Could not read the Excel file. Upload a valid .xlsx workbook.")
+        try:
+            ws = wb.worksheets[0]
+            rows_iter = ws.iter_rows(values_only=True)
+            header = next(rows_iter, None)
+            if not header:
+                return [], []
+            keys = [_cell_text(h).strip().lower() for h in header]
+            records = []
+            for row_idx, values in enumerate(rows_iter, start=2):
+                if values is None or all(v is None or _cell_text(v).strip() == "" for v in values):
+                    continue  # skip blank lines
+                records.append((row_idx, {k: _cell_text(v) for k, v in zip(keys, values) if k}))
+        finally:
+            wb.close()
+        return cls.parse_records(records)
+
+    @classmethod
+    def parse_records(
+        cls, records: Iterable[Tuple[int, Dict[str, Any]]]
+    ) -> Tuple[List[ParsedCatalogueRow], List[ImportErrorItem]]:
+        """Validate (row_number, {column: text}) records into catalogue rows and per-row errors."""
         valid_rows: List[ParsedCatalogueRow] = []
         errors: List[ImportErrorItem] = []
+        seen_codes: Dict[str, int] = {}
 
-        for row_idx, raw in enumerate(reader, start=2):  # row 1 is header
+        for count, (row_idx, raw) in enumerate(records, start=1):
+            if count > cls.MAX_ROWS:
+                raise ValueError(f"Too many rows (max {cls.MAX_ROWS} per file)")
+            raw = {str(k).strip().lower(): ("" if v is None else str(v)) for k, v in raw.items() if k is not None}
             code = raw.get("code", "").strip()
             name = raw.get("name", "").strip()
             tamil_name = raw.get("tamil_name", "").strip() or None
@@ -85,6 +166,21 @@ class CatalogueImportEngine:
                 continue
             if base_unit not in cls.VALID_BASE_UNITS:
                 errors.append(ImportErrorItem(row_number=row_idx, field="base_unit", message=f"Base unit must be one of {cls.VALID_BASE_UNITS}"))
+                continue
+            if code.upper() in seen_codes:
+                errors.append(ImportErrorItem(
+                    row_number=row_idx, field="code",
+                    message=f"Duplicate code {code} (already on row {seen_codes[code.upper()]})",
+                ))
+                continue
+
+            gst_text = raw.get("gst_rate_percent", "").strip().rstrip("%")
+            try:
+                gst_rate = Decimal(gst_text) if gst_text else Decimal("18")
+            except InvalidOperation:
+                gst_rate = None
+            if gst_rate is None or gst_rate not in cls.VALID_GST_RATES:
+                errors.append(ImportErrorItem(row_number=row_idx, field="gst_rate_percent", message="GST rate must be 0, 5, 12, 18 or 28"))
                 continue
 
             try:
@@ -125,10 +221,55 @@ class CatalogueImportEngine:
                     packing_unit=packing_unit,
                     packing_factor=packing_factor,
                     opening_stock_base=opening_stock,
+                    gst_rate_percent=gst_rate.quantize(Decimal("0.01")),
                 )
             )
+            seen_codes[code.upper()] = row_idx
 
         return valid_rows, errors
+
+    @classmethod
+    async def import_rows(
+        cls,
+        tenant_id: str,
+        file_name: str,
+        valid_rows: List[ParsedCatalogueRow],
+        errors: List[ImportErrorItem],
+        session: AsyncSession,
+        dry_run: bool = False,
+    ) -> ImportResultSchema:
+        """Commit valid rows (unless dry_run) and build the per-row result summary."""
+        row_results: Dict[int, ImportRowResult] = {}
+        for err in errors:
+            res = row_results.setdefault(err.row_number, ImportRowResult(row_number=err.row_number, status="ERROR"))
+            res.errors.append(err)
+
+        summary: Dict[str, Any] = {}
+        if valid_rows and not dry_run:
+            summary = await cls.commit_catalogue(tenant_id, valid_rows, session)
+            created_codes = set(summary.get("created_codes", []))
+            for r in valid_rows:
+                row_results[r.row_number] = ImportRowResult(
+                    row_number=r.row_number, code=r.code,
+                    status="CREATED" if r.code.upper() in created_codes else "UPDATED",
+                )
+        else:
+            for r in valid_rows:
+                row_results[r.row_number] = ImportRowResult(row_number=r.row_number, code=r.code, status="VALID")
+
+        return ImportResultSchema(
+            file_name=file_name,
+            dry_run=dry_run,
+            committed=bool(valid_rows) and not dry_run,
+            total_rows=len(row_results),
+            valid_rows_count=len(valid_rows),
+            invalid_rows_count=len({e.row_number for e in errors}),
+            products_created=summary.get("products_created", 0),
+            products_updated=summary.get("products_updated", 0),
+            units_created=summary.get("units_created", 0),
+            prices_created=summary.get("prices_created", 0),
+            rows=[row_results[k] for k in sorted(row_results)],
+        )
 
     @classmethod
     async def commit_catalogue(
@@ -161,7 +302,13 @@ class CatalogueImportEngine:
             select(Godown).where(Godown.tenant_id == tenant_id, Godown.is_primary.is_(True))
         )
         primary_godown = godown_result.scalar_one_or_none()
-        primary_godown_id = primary_godown.id if primary_godown else str(uuid.uuid4())
+        if not primary_godown:
+            primary_godown = (
+                await session.execute(select(Godown).where(Godown.tenant_id == tenant_id).limit(1))
+            ).scalar_one_or_none()
+        if not primary_godown and any(r.opening_stock_base > Decimal("0") for r in rows):
+            raise ValueError("No godown configured for tenant; cannot post opening stock")
+        primary_godown_id = primary_godown.id if primary_godown else None
 
         # Pre-load existing products by code
         existing_products: Dict[str, Product] = {}
@@ -175,6 +322,7 @@ class CatalogueImportEngine:
         products_updated = 0
         units_created = 0
         prices_created = 0
+        created_codes: List[str] = []
 
         for r in rows:
             # Category
@@ -205,6 +353,7 @@ class CatalogueImportEngine:
                 existing_prod.base_unit = r.base_unit
                 existing_prod.is_variable_weight = r.is_variable_weight
                 existing_prod.purchase_price_base = r.purchase_price
+                existing_prod.gst_rate_percent = r.gst_rate_percent
                 product_id = existing_prod.id
                 products_updated += 1
             else:
@@ -222,9 +371,11 @@ class CatalogueImportEngine:
                     base_unit=r.base_unit,
                     is_variable_weight=r.is_variable_weight,
                     purchase_price_base=r.purchase_price,
+                    gst_rate_percent=r.gst_rate_percent,
                 )
                 session.add(product)
                 products_created += 1
+                created_codes.append(r.code.upper())
 
                 # Base Unit
                 base_unit_obj = ProductUnit(
@@ -239,8 +390,11 @@ class CatalogueImportEngine:
                 session.add(base_unit_obj)
                 units_created += 1
 
-            # Packaging Unit if defined
-            if r.packing_unit and r.packing_factor:
+            # Packaging Unit if defined (skip if a re-imported product already has it)
+            existing_unit_names = (
+                {u.unit_name.lower() for u in existing_prod.units} if existing_prod else set()
+            )
+            if r.packing_unit and r.packing_factor and r.packing_unit.lower() not in existing_unit_names:
                 pack_unit_obj = ProductUnit(
                     id=str(uuid.uuid4()),
                     tenant_id=tenant_id,
@@ -252,6 +406,12 @@ class CatalogueImportEngine:
                 )
                 session.add(pack_unit_obj)
                 units_created += 1
+
+            # Re-import replaces current prices: archive the active rows first (history is preserved)
+            if existing_prod:
+                for old_price in existing_prod.prices:
+                    if old_price.effective_to is None and old_price.unit_name == r.base_unit:
+                        old_price.effective_to = datetime.now(timezone.utc)
 
             # Retail Price
             if "RETAIL" in price_lists:
@@ -277,6 +437,20 @@ class CatalogueImportEngine:
                         unit_name=r.base_unit,
                         price_list_id=price_lists["CONTRACTOR"],
                         price=r.price_contractor,
+                    )
+                )
+                prices_created += 1
+
+            # Wholesale Price
+            if r.price_wholesale and "WHOLESALE" in price_lists:
+                session.add(
+                    ProductPrice(
+                        id=str(uuid.uuid4()),
+                        tenant_id=tenant_id,
+                        product_id=product_id,
+                        unit_name=r.base_unit,
+                        price_list_id=price_lists["WHOLESALE"],
+                        price=r.price_wholesale,
                     )
                 )
                 prices_created += 1
@@ -307,8 +481,14 @@ class CatalogueImportEngine:
                 )
                 existing_bal = bal_res.scalar_one_or_none()
                 if existing_bal:
-                    existing_bal.current_quantity_base = r.opening_stock_base
-                    existing_bal.weighted_avg_cost_base = r.purchase_price
+                    # Balance must equal the sum of movements: add the inward OPENING qty and re-average cost
+                    existing_bal.weighted_avg_cost_base = SmartUnitConverter.calculate_weighted_average_cost(
+                        current_base_qty=existing_bal.current_quantity_base,
+                        current_wac_base=existing_bal.weighted_avg_cost_base,
+                        inward_base_qty=r.opening_stock_base,
+                        inward_landed_cost_base=r.purchase_price,
+                    )
+                    existing_bal.current_quantity_base += r.opening_stock_base
                 else:
                     session.add(
                         StockBalance(
@@ -329,4 +509,5 @@ class CatalogueImportEngine:
             "products_updated": products_updated,
             "units_created": units_created,
             "prices_created": prices_created,
+            "created_codes": created_codes,
         }

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 
@@ -15,11 +16,17 @@ connect_args = {}
 if settings.DATABASE_URL.startswith("sqlite"):
     connect_args["check_same_thread"] = False
 
+engine_kwargs = {}
+if settings.ENVIRONMENT == "testing" and not settings.DATABASE_URL.startswith("sqlite"):
+    # pytest-asyncio runs each test on its own event loop; pooled asyncpg connections cannot cross loops
+    engine_kwargs["poolclass"] = NullPool
+
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     connect_args=connect_args,
     future=True,
+    **engine_kwargs,
 )
 
 async_session_factory = async_sessionmaker(

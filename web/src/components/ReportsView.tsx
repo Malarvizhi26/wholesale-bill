@@ -25,13 +25,18 @@ import type {
 } from '../types';
 import { api } from '../api/client';
 
-interface ReportsViewProps {
+export type ReportsTab = 'SALES' | 'MARGIN' | 'EXPENSES' | 'CREDIT' | 'STOCK' | 'CASH_RECON' | 'REVIEW';
+
+export interface ReportsViewProps {
   language: Language;
+  initialTab?: ReportsTab;
 }
 
-export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
-  const [activeTab, setActiveTab] = useState<'SALES' | 'MARGIN' | 'EXPENSES' | 'CREDIT' | 'STOCK' | 'CASH_RECON'>('SALES');
-  const todayStr = new Date().toISOString().split('T')[0];
+export const ReportsView: React.FC<ReportsViewProps> = ({ language, initialTab }) => {
+  const [activeTab, setActiveTab] = useState<ReportsTab>(initialTab ?? 'SALES');
+  // Local calendar date (toISOString() is UTC: before 05:30 IST it returns yesterday)
+  const now = new Date();
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
   // Date filters
   const [startDate, setStartDate] = useState(todayStr);
@@ -44,6 +49,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
   const [creditReport, setCreditReport] = useState<OutstandingCreditReport | null>(null);
   const [stockReport, setStockReport] = useState<StockValuationReport | null>(null);
   const [loading, setLoading] = useState(false);
+  const [reportError, setReportError] = useState<string | null>(null);
 
   // Record Expense modal state
   const [showExpenseModal, setShowExpenseModal] = useState(false);
@@ -85,6 +91,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
   // Fetch report data on tab or date range change
   const loadReportData = async () => {
     setLoading(true);
+    setReportError(null);
     try {
       if (activeTab === 'SALES') {
         const data = await api.getDailySalesSummary(startDate, endDate);
@@ -102,8 +109,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
         const data = await api.getStockValuationReport();
         setStockReport(data);
       }
-    } catch {
-      // offline fallback
+    } catch (err: any) {
+      setReportError(err?.message || 'Failed to load report');
     } finally {
       setLoading(false);
     }
@@ -166,6 +173,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-4 space-y-4">
+      {reportError && (
+        <div className="bg-red-950/70 border border-red-800 text-red-300 text-xs rounded-lg px-3 py-2">
+          Report not loaded: {reportError}
+        </div>
+      )}
       {/* Top Header */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-3 hardware-card p-4 shadow-md">
         <div>
@@ -309,7 +321,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
                 ₹{(salesSummary?.total_tax ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
               </div>
               <div className="text-[11px] text-slate-400">
-                CGST: ₹{salesSummary?.cgst_amount?.toLocaleString() ?? 0} • SGST: ₹{salesSummary?.sgst_amount?.toLocaleString() ?? 0}
+                CGST: ₹{salesSummary?.cgst_amount?.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? 0} • SGST: ₹{salesSummary?.sgst_amount?.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? 0}
               </div>
             </div>
 
@@ -319,7 +331,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
                 ₹{(salesSummary?.grand_total ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
               </div>
               <div className="text-[11px] text-slate-400">
-                Round-off: ₹{salesSummary?.round_off?.toLocaleString() ?? 0}
+                Round-off: ₹{salesSummary?.round_off?.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? 0}
               </div>
             </div>
           </div>
@@ -364,7 +376,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
                       <tr key={i} className="hover:bg-slate-800/30 text-slate-200">
                         <td className="p-2 font-bold text-emerald-400">{h.hour}</td>
                         <td className="p-2 text-center">{h.invoice_count}</td>
-                        <td className="p-2 text-right">₹{h.total_sales.toLocaleString()}</td>
+                        <td className="p-2 text-right">₹{h.total_sales.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -451,13 +463,13 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
                           {p.quantity_sold_base} {p.base_unit}
                         </td>
                         <td className="p-3 text-right font-mono">
-                          ₹{p.taxable_sales.toLocaleString()}
+                          ₹{p.taxable_sales.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         </td>
                         <td className="p-3 text-right font-mono text-slate-400">
-                          ₹{p.cogs.toLocaleString()}
+                          ₹{p.cogs.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         </td>
                         <td className="p-3 text-right font-mono font-bold text-emerald-400">
-                          ₹{p.gross_profit.toLocaleString()}
+                          ₹{p.gross_profit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         </td>
                         <td className="p-3 text-center">
                           <span className={`px-2 py-0.5 rounded text-[11px] font-mono font-bold ${
@@ -628,7 +640,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
                       <tr key={d.party_id} className="hover:bg-slate-700/30 text-slate-200">
                         <td className="p-3 font-bold text-white">{d.party_name}</td>
                         <td className="p-3 font-mono text-slate-400">{d.phone || 'No phone'}</td>
-                        <td className="p-3 text-right font-mono">₹{d.credit_limit.toLocaleString()}</td>
+                        <td className="p-3 text-right font-mono">₹{d.credit_limit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                         <td className="p-3 text-center font-mono">
                           <span className={d.days_overdue > 0 ? 'text-red-400 font-bold' : 'text-slate-400'}>
                             {d.days_overdue}d
@@ -816,7 +828,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
               {/* Counted Total */}
               <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 flex items-center justify-between font-mono">
                 <span className="text-xs text-slate-400 uppercase font-bold">Total Actual Cash Counted:</span>
-                <span className="text-xl font-bold text-emerald-400">₹{countedCash.toLocaleString()}</span>
+                <span className="text-xl font-bold text-emerald-400">₹{countedCash.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
               </div>
 
               <div>
@@ -856,31 +868,31 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
                 <div className="space-y-1.5 text-slate-300 border-t border-slate-800 pt-2">
                   <div className="flex justify-between">
                     <span>Opening Cash:</span>
-                    <span>₹{reconcileResult.opening_cash.toLocaleString()}</span>
+                    <span>₹{reconcileResult.opening_cash.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                   </div>
                   <div className="flex justify-between text-emerald-400">
                     <span>(+) Cash Sales:</span>
-                    <span>₹{reconcileResult.cash_sales_amount.toLocaleString()}</span>
+                    <span>₹{reconcileResult.cash_sales_amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                   </div>
                   <div className="flex justify-between text-emerald-400">
                     <span>(+) Cash Receipts:</span>
-                    <span>₹{reconcileResult.cash_ledger_receipts.toLocaleString()}</span>
+                    <span>₹{reconcileResult.cash_ledger_receipts.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                   </div>
                   <div className="flex justify-between text-red-400">
                     <span>(-) Cash Expenses:</span>
-                    <span>₹{reconcileResult.cash_expenses_paid.toLocaleString()}</span>
+                    <span>₹{reconcileResult.cash_expenses_paid.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                   </div>
                   <div className="flex justify-between text-red-400">
                     <span>(-) Supplier Payouts:</span>
-                    <span>₹{reconcileResult.cash_supplier_payouts.toLocaleString()}</span>
+                    <span>₹{reconcileResult.cash_supplier_payouts.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                   </div>
                   <div className="flex justify-between font-bold text-white border-t border-slate-700 pt-1">
                     <span>Expected Drawer Cash:</span>
-                    <span>₹{reconcileResult.expected_cash_drawer.toLocaleString()}</span>
+                    <span>₹{reconcileResult.expected_cash_drawer.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                   </div>
                   <div className="flex justify-between font-bold text-emerald-300">
                     <span>Actual Cash Counted:</span>
-                    <span>₹{reconcileResult.actual_cash_counted.toLocaleString()}</span>
+                    <span>₹{reconcileResult.actual_cash_counted.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                   </div>
                   <div className={`flex justify-between font-bold text-sm border-t border-slate-700 pt-1 ${
                     reconcileResult.discrepancy_amount === 0 ? 'text-emerald-400' : reconcileResult.discrepancy_amount < 0 ? 'text-red-400' : 'text-blue-400'
@@ -889,7 +901,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ language }) => {
                     <span>
                       {reconcileResult.discrepancy_amount === 0
                         ? '₹0.00 (Exact Match ✓)'
-                        : `₹${reconcileResult.discrepancy_amount.toLocaleString()} (${reconcileResult.discrepancy_amount < 0 ? 'Shortage' : 'Excess'})`}
+                        : `₹${reconcileResult.discrepancy_amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (${reconcileResult.discrepancy_amount < 0 ? 'Shortage' : 'Excess'})`}
                     </span>
                   </div>
                 </div>

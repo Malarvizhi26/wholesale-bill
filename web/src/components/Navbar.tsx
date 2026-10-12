@@ -8,6 +8,11 @@ interface NavbarProps {
   language: Language;
   setLanguage: (lang: Language) => void;
   isBackendConnected: boolean;
+  pendingSyncCount?: number;
+  syncErrorCount?: number;
+  isSyncing?: boolean;
+  onSyncNow?: () => void;
+  onOpenPinSettings?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -16,6 +21,11 @@ export const Navbar: React.FC<NavbarProps> = ({
   language,
   setLanguage,
   isBackendConnected,
+  pendingSyncCount: _pendingSyncCount,
+  syncErrorCount: _syncErrorCount,
+  isSyncing: _isSyncing,
+  onSyncNow: _onSyncNow,
+  onOpenPinSettings: _onOpenPinSettings,
 }) => {
   return (
     <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-50">

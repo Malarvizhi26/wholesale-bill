@@ -4,6 +4,7 @@ from typing import Optional
 from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.timeutils import today_ist
 from app.models.base import TenantScopedModel, utc_now
 
 
@@ -40,7 +41,7 @@ class LedgerEntry(TenantScopedModel):
     reference_doc_type: Mapped[str] = mapped_column(String(50), nullable=False)
     reference_doc_id: Mapped[str] = mapped_column(String(36), nullable=False)
     reference_doc_number: Mapped[str] = mapped_column(String(60), nullable=False)
-    entry_date: Mapped[date] = mapped_column(Date, default=date.today, nullable=False)
+    entry_date: Mapped[date] = mapped_column(Date, default=today_ist, nullable=False)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 

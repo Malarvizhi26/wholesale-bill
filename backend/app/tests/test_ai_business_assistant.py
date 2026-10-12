@@ -33,6 +33,17 @@ from app.modules.ai_assistant.ai_service import AIAssistantService
 DEMO_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
+async def _default_price_list_id(session) -> str:
+    """Real FK target (SQLite does not enforce foreign keys, PostgreSQL does)."""
+    from app.models.catalogue import PriceList
+    return await session.scalar(select(PriceList.id).where(PriceList.tenant_id == DEMO_TENANT_ID, PriceList.is_default.is_(True)))
+
+
+async def _primary_godown_id(session) -> str:
+    from app.models.stock import Godown
+    return await session.scalar(select(Godown.id).where(Godown.tenant_id == DEMO_TENANT_ID, Godown.is_primary.is_(True)))
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def setup_db():
     await init_db()
@@ -56,8 +67,8 @@ async def test_ai_profit_by_product_query():
             invoice_date=datetime.now(timezone.utc),
             customer_name="Cash Walk-in",
             place_of_supply_state_code="33",
-            price_list_id=str(uuid.uuid4()),
-            godown_id=str(uuid.uuid4()),
+            price_list_id=await _default_price_list_id(session),
+            godown_id=await _primary_godown_id(session),
             status="POSTED",
             subtotal_amount=Decimal("5000.00"),
             discount_amount=Decimal("0.00"),
@@ -136,6 +147,7 @@ async def test_ai_get_receivables_query():
             is_active=True,
         )
         session.add(cust)
+        await session.flush()  # no relationship(): insert the party before its ledger entry
 
         # Add overdue debit ledger entry (45 days old)
         entry_date = date.today() - timedelta(days=45)

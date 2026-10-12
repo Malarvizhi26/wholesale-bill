@@ -24,8 +24,11 @@ export interface Product {
   min_stock_base: number;
   reorder_quantity_base?: number;
   purchase_price_base: number;
+  // GST slab from the product master (0 / 5 / 12 / 18 / 28)
+  gst_rate_percent?: number;
   units: ProductUnit[];
-  // helper for POS
+  // Stock in base units summed across godowns (or the requested godown) + packaging breakdown
+  current_stock_base?: number;
   stock_base?: number;
   display_stock?: string;
 }
@@ -42,6 +45,8 @@ export interface ProductCreateInput {
   min_stock_base?: number;
   reorder_quantity_base?: number;
   purchase_price_base: number;
+  gst_rate_percent?: number;
+  prices?: Array<{ price_list_id: string; unit_name: string; price: number; min_allowed_price?: number }>;
   units?: Array<{
     unit_name: string;
     conversion_factor: number;
@@ -66,7 +71,17 @@ export interface Party {
   credit_days: number;
   current_balance: number;
   opening_balance?: number;
-  price_list_code?: 'RETAIL' | 'CONTRACTOR' | 'WHOLESALE';
+  // Price tier (Retail / Contractor / Wholesale ...) resolved by the server from price_list_id
+  price_list_id?: string;
+  price_list_code?: string;
+  price_list_name?: string;
+}
+
+export interface PriceList {
+  id: string;
+  code: string;
+  name: string;
+  is_default: boolean;
 }
 
 export interface PartyCreateInput {
@@ -80,7 +95,23 @@ export interface PartyCreateInput {
   credit_limit?: number;
   credit_days?: number;
   opening_balance?: number;
-  price_list_code?: 'RETAIL' | 'CONTRACTOR' | 'WHOLESALE';
+  price_list_code?: string;
+  price_list_id?: string;
+}
+
+export interface PartyUpdateInput {
+  party_type?: 'CUSTOMER' | 'SUPPLIER' | 'BOTH';
+  name?: string;
+  phone?: string;
+  email?: string;
+  gstin?: string;
+  state_code?: string;
+  billing_address?: string;
+  credit_limit?: number;
+  credit_days?: number;
+  price_list_code?: string;
+  price_list_id?: string;
+  is_active?: boolean;
 }
 
 export interface POSLineItem {
@@ -108,6 +139,9 @@ export interface POSLineItem {
   igstAmount: number;
   lineTotal: number;
   availableUnits: ProductUnit[];
+  // Selling price per unit name from the customer's price list (via /billing/search)
+  unitPrices?: Record<string, number>;
+  returnCondition?: 'EXCESS' | 'DAMAGED';
 }
 
 export interface BillSummary {
@@ -129,6 +163,7 @@ export interface HeldBill {
   id: string;
   heldAt: string;
   partyName: string;
+  partyId?: string;
   lines: POSLineItem[];
   grandTotal: number;
 }
@@ -321,6 +356,8 @@ export interface SalesInvoiceRecord {
   payment_breakdown?: any;
   upi_qr_string?: string;
   is_offline_created: boolean;
+  // Server-side soft warnings, e.g. NEGATIVE_STOCK_WARNING, CREDIT_LIMIT_EXCEEDED, BELOW_FLOOR_PRICE
+  review_flags?: string[];
   lines: Array<{
     id: string;
     line_number: number;
@@ -369,6 +406,7 @@ export interface SalesReturnRecord {
     gst_rate_percent: number;
     tax_amount: number;
     line_total: number;
+    return_condition?: 'EXCESS' | 'DAMAGED';
   }>;
 }
 
@@ -513,10 +551,14 @@ export interface InvoiceDueItem {
   is_overdue: boolean;
 }
 
+export type LedgerSide = 'RECEIVABLE' | 'PAYABLE';
+
 export interface PartyAgeingSummary {
   party_id: string;
   party_name: string;
   phone?: string;
+  // RECEIVABLE = customer sales bills, PAYABLE = supplier purchase bills
+  side: LedgerSide;
   credit_limit: number;
   credit_days: number;
   current_balance: number;
@@ -724,6 +766,8 @@ export interface CashDrawerReconcileRecord {
   opening_cash: number;
   cash_sales_amount: number;
   cash_ledger_receipts: number;
+  // CASH refunds paid on sales returns that day (already subtracted from expected_cash_drawer)
+  cash_refunds_paid: number;
   cash_expenses_paid: number;
   cash_supplier_payouts: number;
   expected_cash_drawer: number;
@@ -803,3 +847,63 @@ export interface AIQueryResponse {
 
 
 
+
+
+// =============================================================================
+// Owner review flags, offline sync & catalogue import
+// =============================================================================
+
+export type ReviewFlagType = 'NEGATIVE_STOCK_WARNING' | 'CREDIT_LIMIT_EXCEEDED' | 'BELOW_FLOOR_PRICE' | string;
+
+export interface ReviewFlag {
+  id: string;
+  alert_type: ReviewFlagType;
+  status: 'OPEN' | 'RESOLVED';
+  reference_doc_type: string;
+  reference_doc_id: string;
+  reference_doc_number: string;
+  product_id?: string | null;
+  party_id?: string | null;
+  godown_id?: string | null;
+  message: string;
+  is_offline_created: boolean;
+  owner_override: boolean;
+  created_at: string;
+  resolved_at?: string | null;
+  resolution_notes?: string | null;
+}
+
+export interface SyncInvoiceResult {
+  invoice_number?: string | null;
+  status: 'SYNCED' | 'ERROR';
+  invoice_id?: string | null;
+  review_flags: string[];
+  error?: string | null;
+}
+
+export interface ImportErrorItem {
+  row_number: number;
+  field: string;
+  message: string;
+}
+
+export interface ImportRowResult {
+  row_number: number;
+  code?: string | null;
+  status: 'CREATED' | 'UPDATED' | 'VALID' | 'ERROR';
+  errors: ImportErrorItem[];
+}
+
+export interface ImportResult {
+  file_name: string;
+  dry_run: boolean;
+  committed: boolean;
+  total_rows: number;
+  valid_rows_count: number;
+  invalid_rows_count: number;
+  products_created: number;
+  products_updated: number;
+  units_created: number;
+  prices_created: number;
+  rows: ImportRowResult[];
+}

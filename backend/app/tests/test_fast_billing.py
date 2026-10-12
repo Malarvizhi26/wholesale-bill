@@ -227,6 +227,68 @@ async def test_sales_return_and_credit_note():
 
 
 @pytest.mark.asyncio
+async def test_sales_return_damaged_material_not_restocked():
+    """Verify that when customer returns damaged material, credit note is issued but stock is NOT added to sellable inventory."""
+    headers = {"X-Tenant-ID": DEMO_TENANT_ID}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        prods_res = await ac.get("/api/v1/billing/search?q=SCR001", headers=headers)
+        screw = prods_res.json()[0]
+
+        parties_res = await ac.get("/api/v1/ledger/parties", headers=headers)
+        customer = next(p for p in parties_res.json() if p["party_type"] == "CUSTOMER")
+
+        # Initial stock balance of screws
+        async with async_session_factory() as session:
+            sb_before = await session.scalar(
+                select(StockBalance).where(StockBalance.product_id == screw["id"])
+            )
+            initial_stock = sb_before.current_quantity_base if sb_before else Decimal("0.0000")
+
+        # Post Damaged Sales Return
+        return_payload = {
+            "party_id": customer["id"],
+            "customer_name": customer["name"],
+            "refund_mode": "CREDIT_NOTE",
+            "reason": "Damaged defective materials returned from site",
+            "lines": [
+                {
+                    "product_id": screw["id"],
+                    "unit_name": "Box",
+                    "conversion_factor": 100,
+                    "quantity": 2,
+                    "unit_price": 200.00,
+                    "gst_rate_percent": 18.00,
+                    "return_condition": "DAMAGED",  # Marked as damaged!
+                }
+            ],
+        }
+
+        ret_res = await ac.post("/api/v1/billing/returns", json=return_payload, headers=headers)
+        assert ret_res.status_code == 201
+        ret = ret_res.json()
+        assert ret["lines"][0]["return_condition"] == "DAMAGED"
+
+        # Check stock movement is logged as SALES_RETURN_DAMAGED
+        async with async_session_factory() as session:
+            sm = await session.scalar(
+                select(StockMovement).where(
+                    StockMovement.reference_doc_id == ret["id"],
+                    StockMovement.movement_type == "SALES_RETURN_DAMAGED",
+                )
+            )
+            assert sm is not None
+            assert "(DAMAGED)" in sm.reference_doc_number
+
+            # CRITICAL: Verify sellable StockBalance was NOT incremented!
+            sb_after = await session.scalar(
+                select(StockBalance).where(StockBalance.product_id == screw["id"])
+            )
+            current_stock = sb_after.current_quantity_base if sb_after else Decimal("0.0000")
+            assert current_stock == initial_stock  # Stock did NOT increase!
+
+
+@pytest.mark.asyncio
 async def test_quotation_creation_and_conversion():
     """Verify quotation creation does NOT move stock, and 1-click conversion to invoice converts and moves stock."""
     headers = {"X-Tenant-ID": DEMO_TENANT_ID}

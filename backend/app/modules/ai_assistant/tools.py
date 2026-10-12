@@ -13,6 +13,7 @@ from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.timeutils import today_ist
 from app.models.catalogue import Product
 from app.models.stock import Godown, StockBalance, StockMovement
 from app.models.ledger import Party, LedgerEntry
@@ -26,7 +27,7 @@ FOUR_PLACES = Decimal("0.0001")
 
 
 def _get_date_range_for_period(period: str) -> tuple[date, date]:
-    today = date.today()
+    today = today_ist()
     period_upper = (period or "TODAY").upper()
     if period_upper in ("TODAY", "INDRU"):
         return today, today
@@ -58,7 +59,7 @@ async def get_receivables(
     min_amount: Decimal = Decimal("0.00"),
 ) -> Dict[str, Any]:
     """Fetch customer outstanding receivables, overdue amounts, and aging breakdown."""
-    credit_report = await ReportsService.get_outstanding_credit_report(session, tenant_id)
+    credit_report = await ReportsService.get_outstanding_credit_report(session, tenant_id, limit=None)
 
     debtors_list = []
     filtered_outstanding = Decimal("0.00")
@@ -69,14 +70,9 @@ async def get_receivables(
             continue
 
         if min_days > 0:
-            # Check if customer has dues older than min_days
-            has_old_due = debtor.bucket_90_plus > 0 or (
-                min_days <= 60 and (debtor.bucket_61_90 > 0 or debtor.bucket_90_plus > 0)
-            ) or (
-                min_days <= 30 and (debtor.bucket_31_60 > 0 or debtor.bucket_61_90 > 0 or debtor.bucket_90_plus > 0)
-            ) or debtor.total_overdue > 0
-
-            if not has_old_due:
+            # Keep only customers holding at least one open bill aged >= min_days (exact per-bill age)
+            open_dues = await LedgerService.get_party_open_dues(session, tenant_id, debtor.party_id)
+            if not any(inv.age_days >= min_days for inv in open_dues):
                 continue
 
         debtors_list.append({

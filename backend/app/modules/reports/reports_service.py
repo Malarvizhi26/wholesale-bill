@@ -8,11 +8,12 @@ import uuid
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.timeutils import ist_day_bounds_utc, to_ist, today_ist
 from app.models.tenant import NumberSeries
 from app.models.catalogue import Product, ProductUnit
 from app.models.stock import Godown, StockBalance, StockMovement
 from app.models.ledger import Party, LedgerEntry
-from app.models.billing import SalesInvoice, SalesInvoiceLine
+from app.models.billing import SalesInvoice, SalesInvoiceLine, SalesReturn
 from app.models.reports import Expense, CashDrawerSession
 from app.modules.ledger.ledger_service import LedgerService
 from app.modules.inventory.unit_converter import SmartUnitConverter, UnitDefinition
@@ -38,6 +39,33 @@ FOUR_PLACES = Decimal("0.0001")
 
 class ReportsService:
 
+    @staticmethod
+    def _split_cash_portion(breakdown: Any, paid_amount: Decimal) -> Decimal:
+        """Cash part of a SPLIT payment.
+
+        Accepts {"CASH": 500, "UPI": 300} or {"payments": [{"mode": "CASH", "amount": 500}, ...]}
+        (or a bare list of such items). Falls back to the full paid amount if no breakdown is stored.
+        """
+        if not breakdown:
+            return paid_amount
+        items: List[Any] = []
+        if isinstance(breakdown, list):
+            items = breakdown
+        elif isinstance(breakdown, dict):
+            nested = breakdown.get("payments") or breakdown.get("breakdown")
+            if isinstance(nested, list):
+                items = nested
+            else:
+                for mode, amt in breakdown.items():
+                    if str(mode).upper() == "CASH":
+                        return Decimal(str(amt)).quantize(TWO_PLACES)
+                return Decimal("0.00")
+        cash = Decimal("0.00")
+        for it in items:
+            if isinstance(it, dict) and str(it.get("mode", "")).upper() == "CASH":
+                cash += Decimal(str(it.get("amount", 0)))
+        return cash.quantize(TWO_PLACES)
+
     # -------------------------------------------------------------------------
     # Helper: Number Series
     # -------------------------------------------------------------------------
@@ -58,20 +86,39 @@ class ReportsService:
         series = res.scalar_one_or_none()
 
         if not series:
+            # Check highest existing number in Expense to avoid collision with pre-seeded data
+            existing_vouchers = (await session.execute(
+                select(Expense.voucher_number).where(Expense.tenant_id == tenant_id)
+            )).scalars().all()
+            max_num = 0
+            for v in existing_vouchers:
+                if v and v.startswith(default_prefix):
+                    try:
+                        max_num = max(max_num, int(v[len(default_prefix):]))
+                    except ValueError:
+                        pass
+            num = max_num + 1
             series = NumberSeries(
                 tenant_id=tenant_id,
                 doc_type=doc_type,
                 financial_year=financial_year,
                 prefix=default_prefix,
-                current_number=1,
+                current_number=num,
                 range_start=1,
                 range_end=999999,
             )
             session.add(series)
-            num = 1
         else:
             series.current_number += 1
-            num = series.current_number
+            while True:
+                num = series.current_number
+                candidate = f"{series.prefix}{num:04d}"
+                exists = (await session.execute(
+                    select(Expense.id).where(Expense.tenant_id == tenant_id, Expense.voucher_number == candidate)
+                )).scalar_one_or_none()
+                if not exists:
+                    break
+                series.current_number += 1
 
         return f"{series.prefix}{num:04d}"
 
@@ -85,20 +132,19 @@ class ReportsService:
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
     ) -> DailySalesSummarySchema:
-        """Aggregate total sales, tax split, payment modes, and hourly distribution."""
+        """Aggregate total sales, tax split, payment modes, and hourly distribution (IST days and hours)."""
         if not start_date:
-            start_date = date.today()
+            start_date = today_ist()
         if not end_date:
             end_date = start_date
 
-        start_dt = datetime.combine(start_date, time.min).replace(tzinfo=timezone.utc)
-        end_dt = datetime.combine(end_date, time.max).replace(tzinfo=timezone.utc)
+        start_dt, end_dt = ist_day_bounds_utc(start_date, end_date)
 
         stmt = select(SalesInvoice).where(
             SalesInvoice.tenant_id == tenant_id,
             SalesInvoice.status == "POSTED",
             SalesInvoice.invoice_date >= start_dt,
-            SalesInvoice.invoice_date <= end_dt,
+            SalesInvoice.invoice_date < end_dt,
         )
         res = await session.execute(stmt)
         invoices = res.scalars().all()
@@ -121,8 +167,8 @@ class ReportsService:
         hours_map: Dict[int, Dict[str, Any]] = {h: {"hour": h, "count": 0, "amount": Decimal("0.00")} for h in range(24)}
 
         for inv in invoices:
-            line_taxable = inv.subtotal_amount - inv.discount_amount
-            taxable_amount += line_taxable
+            # subtotal_amount is already the post-discount taxable value (sum of line taxable amounts)
+            taxable_amount += inv.subtotal_amount
             cgst_amount += inv.cgst_amount
             sgst_amount += inv.sgst_amount
             igst_amount += inv.igst_amount
@@ -133,7 +179,7 @@ class ReportsService:
             mode = inv.payment_mode.upper() if inv.payment_mode else "CASH"
             sales_by_mode[mode] = sales_by_mode.get(mode, Decimal("0.00")) + inv.grand_total
 
-            hr = inv.invoice_date.hour if inv.invoice_date else 0
+            hr = to_ist(inv.invoice_date).hour if inv.invoice_date else 0
             hours_map[hr]["count"] += 1
             hours_map[hr]["amount"] += inv.grand_total
 
@@ -170,12 +216,11 @@ class ReportsService:
     ) -> GrossMarginReportSchema:
         """Calculate sales revenue, COGS based on WAC, and gross margin per product & overall."""
         if not start_date:
-            start_date = date.today()
+            start_date = today_ist()
         if not end_date:
             end_date = start_date
 
-        start_dt = datetime.combine(start_date, time.min).replace(tzinfo=timezone.utc)
-        end_dt = datetime.combine(end_date, time.max).replace(tzinfo=timezone.utc)
+        start_dt, end_dt = ist_day_bounds_utc(start_date, end_date)
 
         stmt = (
             select(SalesInvoiceLine, SalesInvoice, Product)
@@ -185,7 +230,7 @@ class ReportsService:
                 SalesInvoice.tenant_id == tenant_id,
                 SalesInvoice.status == "POSTED",
                 SalesInvoice.invoice_date >= start_dt,
-                SalesInvoice.invoice_date <= end_dt,
+                SalesInvoice.invoice_date < end_dt,
             )
         )
         res = await session.execute(stmt)
@@ -279,7 +324,7 @@ class ReportsService:
         )
 
         expense_id = str(uuid.uuid4())
-        expense_date = payload.expense_date or date.today()
+        expense_date = payload.expense_date or today_ist()
 
         expense = Expense(
             id=expense_id,
@@ -309,7 +354,7 @@ class ReportsService:
     ) -> ExpenseSummarySchema:
         """Aggregate expenses in date range grouped by category and payment mode."""
         if not start_date:
-            start_date = date.today()
+            start_date = today_ist()
         if not end_date:
             end_date = start_date
 
@@ -357,6 +402,7 @@ class ReportsService:
     async def get_outstanding_credit_report(
         session: AsyncSession,
         tenant_id: str,
+        limit: Optional[int] = 50,
     ) -> OutstandingCreditReportSchema:
         """Aggregate total receivables, overdue count, and 4 ageing buckets."""
         stmt = (
@@ -426,7 +472,7 @@ class ReportsService:
             bucket_31_60=b_31_60.quantize(TWO_PLACES),
             bucket_61_90=b_61_90.quantize(TWO_PLACES),
             bucket_90_plus=b_90_plus.quantize(TWO_PLACES),
-            top_debtors=debtor_items[:15],
+            top_debtors=debtor_items[:limit] if limit else debtor_items,
         )
 
     # -------------------------------------------------------------------------
@@ -453,15 +499,19 @@ class ReportsService:
             balances = (await session.execute(sb_stmt)).scalars().all()
 
             qty_base = sum((b.current_quantity_base for b in balances), Decimal("0.0000"))
-            wac_base = Decimal("0.0000")
-            for b in balances:
-                if b.weighted_avg_cost_base > 0:
-                    wac_base = b.weighted_avg_cost_base
-                    break
-            if wac_base == Decimal("0.0000"):
-                wac_base = p.purchase_price_base
 
-            val_cost = (max(Decimal("0.0000"), qty_base) * wac_base).quantize(TWO_PLACES)
+            # Each godown carries its own WAC: value = sum(godown qty x godown WAC); negative stock is valued at 0
+            per_godown_vals: Dict[str, Decimal] = {}
+            for b in balances:
+                b_wac = b.weighted_avg_cost_base if b.weighted_avg_cost_base > 0 else p.purchase_price_base
+                per_godown_vals[b.godown_id] = (max(Decimal("0.0000"), b.current_quantity_base) * b_wac).quantize(TWO_PLACES)
+            val_cost = sum(per_godown_vals.values(), Decimal("0.00")).quantize(TWO_PLACES)
+
+            positive_qty = sum((max(Decimal("0.0000"), b.current_quantity_base) for b in balances), Decimal("0.0000"))
+            if positive_qty > 0:
+                wac_base = (val_cost / positive_qty).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
+            else:
+                wac_base = next((b.weighted_avg_cost_base for b in balances if b.weighted_avg_cost_base > 0), p.purchase_price_base)
             # Estimate retail value at ~15-20% margin
             val_retail = (val_cost * Decimal("1.18")).quantize(TWO_PLACES)
 
@@ -485,8 +535,8 @@ class ReportsService:
             disp = SmartUnitConverter.to_display_units(qty_base, p.base_unit, conv_units)
 
             # Godown allocation
-            for b in balances:
-                godown_vals[b.godown_id] = godown_vals.get(b.godown_id, Decimal("0.00")) + (b.current_quantity_base * wac_base).quantize(TWO_PLACES)
+            for gid, gval in per_godown_vals.items():
+                godown_vals[gid] = godown_vals.get(gid, Decimal("0.00")) + gval
 
             items.append(
                 StockValuationItemSchema(
@@ -523,28 +573,38 @@ class ReportsService:
         payload: CashDrawerReconcileCreateSchema,
     ) -> CashDrawerReconcileResponseSchema:
         """Calculate expected drawer cash vs counted cash and save reconciliation voucher."""
-        session_date = payload.session_date or date.today()
-        start_dt = datetime.combine(session_date, time.min).replace(tzinfo=timezone.utc)
-        end_dt = datetime.combine(session_date, time.max).replace(tzinfo=timezone.utc)
+        session_date = payload.session_date or today_ist()
+        start_dt, end_dt = ist_day_bounds_utc(session_date)
 
-        # 1. Cash Sales from SalesInvoices
-        cash_sales_stmt = select(func.coalesce(func.sum(SalesInvoice.paid_amount), Decimal("0"))).where(
+        # 1. Cash Sales from SalesInvoices (only the CASH portion of SPLIT bills)
+        cash_inv_stmt = select(SalesInvoice).where(
             SalesInvoice.tenant_id == tenant_id,
             SalesInvoice.status == "POSTED",
             SalesInvoice.invoice_date >= start_dt,
-            SalesInvoice.invoice_date <= end_dt,
+            SalesInvoice.invoice_date < end_dt,
             or_(SalesInvoice.payment_mode == "CASH", SalesInvoice.payment_mode == "SPLIT"),
         )
-        cash_sales = await session.scalar(cash_sales_stmt) or Decimal("0.00")
+        cash_sales = Decimal("0.00")
+        for inv in (await session.execute(cash_inv_stmt)).scalars().all():
+            if inv.payment_mode == "SPLIT":
+                cash_sales += ReportsService._split_cash_portion(inv.payment_breakdown, inv.paid_amount)
+            else:
+                cash_sales += inv.paid_amount
 
-        # 2. Cash Receipts from Customer Ledger Entries
+        # 2. Cash Receipts from Receipt Vouchers. Counter payments posted with an invoice
+        #    (reference_doc_type SALES_INVOICE) are already part of cash sales above.
         cash_rc_stmt = select(func.coalesce(func.sum(LedgerEntry.credit_amount), Decimal("0"))).where(
             LedgerEntry.tenant_id == tenant_id,
             LedgerEntry.entry_date == session_date,
+            LedgerEntry.entry_type == "PAYMENT_RECEIPT",
+            LedgerEntry.reference_doc_type == "RECEIPT_VOUCHER",
             LedgerEntry.credit_amount > 0,
-            LedgerEntry.notes.like("%CASH%"),
+            LedgerEntry.notes.like("%via CASH%"),
         )
         cash_receipts = await session.scalar(cash_rc_stmt) or Decimal("0.00")
+
+        # 2b. Cash refunds paid out of the drawer on sales returns
+        cash_refunds = await ReportsService._cash_refunds_between(session, tenant_id, start_dt, end_dt)
 
         # 3. Cash Expenses Paid
         cash_exp_stmt = select(func.coalesce(func.sum(Expense.amount), Decimal("0"))).where(
@@ -559,12 +619,14 @@ class ReportsService:
             LedgerEntry.tenant_id == tenant_id,
             LedgerEntry.entry_date == session_date,
             LedgerEntry.entry_type == "SUPPLIER_PAYMENT",
-            LedgerEntry.notes.like("%CASH%"),
+            LedgerEntry.notes.like("%via CASH%"),
         )
         cash_sup_payouts = await session.scalar(cash_sup_stmt) or Decimal("0.00")
 
         # Expected Cash in Drawer
-        expected_cash = (payload.opening_cash + cash_sales + cash_receipts - cash_expenses - cash_sup_payouts).quantize(TWO_PLACES)
+        expected_cash = (
+            payload.opening_cash + cash_sales + cash_receipts - cash_refunds - cash_expenses - cash_sup_payouts
+        ).quantize(TWO_PLACES)
         discrepancy = (payload.actual_cash_counted - expected_cash).quantize(TWO_PLACES)
 
         session_code = await ReportsService.get_next_number(
@@ -588,6 +650,7 @@ class ReportsService:
             opening_cash=payload.opening_cash,
             cash_sales_amount=cash_sales,
             cash_ledger_receipts=cash_receipts,
+            cash_refunds_paid=cash_refunds,
             cash_expenses_paid=cash_expenses,
             cash_supplier_payouts=cash_sup_payouts,
             expected_cash_drawer=expected_cash,
@@ -602,6 +665,19 @@ class ReportsService:
 
         return CashDrawerReconcileResponseSchema.model_validate(drawer_session)
 
+    @staticmethod
+    async def _cash_refunds_between(session: AsyncSession, tenant_id: str, start_dt: datetime, end_dt: datetime) -> Decimal:
+        """Sum of CASH refunds on sales returns in [start_dt, end_dt)."""
+        total = await session.scalar(
+            select(func.coalesce(func.sum(SalesReturn.grand_total), Decimal("0"))).where(
+                SalesReturn.tenant_id == tenant_id,
+                SalesReturn.refund_mode == "CASH",
+                SalesReturn.return_date >= start_dt,
+                SalesReturn.return_date < end_dt,
+            )
+        )
+        return Decimal(total or 0).quantize(TWO_PLACES)
+
     # -------------------------------------------------------------------------
     # 7. Owner Morning Snapshot (< 1 second load)
     # -------------------------------------------------------------------------
@@ -611,9 +687,8 @@ class ReportsService:
         tenant_id: str,
     ) -> OwnerMorningSnapshotSchema:
         """Fast aggregated owner morning snapshot satisfying Module 4 of AGENTS.md."""
-        today = date.today()
-        start_dt = datetime.combine(today, time.min).replace(tzinfo=timezone.utc)
-        end_dt = datetime.combine(today, time.max).replace(tzinfo=timezone.utc)
+        today = today_ist()
+        start_dt, end_dt = ist_day_bounds_utc(today)
 
         # 1. Sales today
         sales_summary = await ReportsService.get_daily_sales_summary(session, tenant_id, today, today)
@@ -626,7 +701,7 @@ class ReportsService:
         net_profit = margin_report.total_gross_profit - expenses_summary.total_expenses
 
         # 4. Receivables & Debtors
-        credit_report = await ReportsService.get_outstanding_credit_report(session, tenant_id)
+        credit_report = await ReportsService.get_outstanding_credit_report(session, tenant_id, limit=None)
 
         # 5. Payables due to suppliers
         sup_stmt = select(func.coalesce(func.sum(Party.current_balance), Decimal("0"))).where(
@@ -642,7 +717,10 @@ class ReportsService:
         stock_report = await ReportsService.get_stock_valuation_report(session, tenant_id)
 
         # 7. Cash in drawer estimate (Cash sales + opening cash - cash expenses)
-        cash_in_drawer = sales_summary.sales_by_mode.get("CASH", Decimal("0.00")) - expenses_summary.cash_expenses
+        cash_refunds_today = await ReportsService._cash_refunds_between(session, tenant_id, start_dt, end_dt)
+        cash_in_drawer = (
+            sales_summary.sales_by_mode.get("CASH", Decimal("0.00")) - cash_refunds_today - expenses_summary.cash_expenses
+        )
         if cash_in_drawer < 0:
             cash_in_drawer = Decimal("0.00")
 

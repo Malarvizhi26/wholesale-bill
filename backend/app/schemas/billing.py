@@ -87,6 +87,8 @@ class SalesInvoiceCreateSchema(BaseModel):
     is_offline_created: bool = False
     offline_created_at: Optional[datetime] = None
     delivery_challan_id: Optional[str] = None  # If converted from Delivery Challan
+    owner_override: bool = False  # Owner approval for credit-limit / floor-price breaches...
+    owner_pin: Optional[str] = Field(default=None, max_length=32)  # ...must carry the owner PIN (verified server-side)
 
 
 class SalesInvoiceLineResponseSchema(BaseModel):
@@ -145,6 +147,8 @@ class SalesInvoiceResponseSchema(BaseModel):
     upi_qr_string: Optional[str] = None
     is_offline_created: bool
     lines: List[SalesInvoiceLineResponseSchema] = []
+    # Conflicts accepted for owner review: NEGATIVE_STOCK_WARNING, CREDIT_LIMIT_EXCEEDED, BELOW_FLOOR_PRICE
+    review_flags: List[str] = []
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -159,7 +163,8 @@ class SalesReturnLineInputSchema(BaseModel):
     conversion_factor: Decimal = Field(default=Decimal("1.0"), gt=0)
     quantity: Decimal = Field(gt=0)
     unit_price: Decimal = Field(ge=0)
-    gst_rate_percent: Decimal = Field(default=Decimal("0.00"), ge=0)
+    gst_rate_percent: Optional[Decimal] = Field(default=None, ge=0)  # None -> product's GST rate
+    return_condition: str = Field(default="EXCESS", description="'EXCESS' (restock) or 'DAMAGED' (do not restock)")
 
 
 class SalesReturnCreateSchema(BaseModel):
@@ -189,6 +194,7 @@ class SalesReturnLineResponseSchema(BaseModel):
     gst_rate_percent: Decimal
     tax_amount: Decimal
     line_total: Decimal
+    return_condition: str = "EXCESS"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -224,7 +230,7 @@ class QuotationLineInputSchema(BaseModel):
     quantity: Decimal = Field(gt=0)
     unit_price: Decimal = Field(ge=0)
     discount_amount: Decimal = Field(default=Decimal("0.00"), ge=0)
-    gst_rate_percent: Decimal = Field(default=Decimal("18.00"), ge=0)
+    gst_rate_percent: Optional[Decimal] = Field(default=None, ge=0)  # None -> product's GST rate
 
 
 class QuotationCreateSchema(BaseModel):
@@ -339,3 +345,32 @@ class DeliveryChallanResponseSchema(BaseModel):
     lines: List[DeliveryChallanLineResponseSchema] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# =============================================================================
+# 6. Owner Review Flags (stock_alerts)
+# =============================================================================
+
+class ReviewFlagResponseSchema(BaseModel):
+    id: str
+    alert_type: str  # 'NEGATIVE_STOCK_WARNING', 'CREDIT_LIMIT_EXCEEDED', 'BELOW_FLOOR_PRICE'
+    status: str  # 'OPEN', 'RESOLVED'
+    reference_doc_type: str
+    reference_doc_id: str
+    reference_doc_number: str
+    product_id: Optional[str] = None
+    party_id: Optional[str] = None
+    godown_id: Optional[str] = None
+    message: str
+    is_offline_created: bool
+    owner_override: bool
+    created_at: datetime
+    resolved_at: Optional[datetime] = None
+    resolution_notes: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ReviewFlagResolveSchema(BaseModel):
+    owner_pin: str = Field(..., max_length=32)
+    notes: Optional[str] = None

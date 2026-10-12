@@ -78,7 +78,10 @@ class PurchaseBill(TenantScopedModel):
     )
 
     __table_args__ = (
-        UniqueConstraint("tenant_id", "supplier_invoice_number", name="uq_purchase_bill_invoice_number"),
+        # Invoice numbers are only unique per supplier: two suppliers may both issue "INV-101"
+        UniqueConstraint(
+            "tenant_id", "supplier_id", "supplier_invoice_number", name="uq_purchase_bill_supplier_invoice"
+        ),
     )
 
 
@@ -140,3 +143,26 @@ class StockAdjustmentLine(TenantScopedModel):
     discrepancy_value: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
 
     adjustment: Mapped["StockAdjustment"] = relationship("StockAdjustment", back_populates="lines")
+
+
+class StockAlert(TenantScopedModel):
+    """Owner review queue: conflicts accepted at billing time instead of being rejected.
+
+    alert_type: 'NEGATIVE_STOCK_WARNING', 'CREDIT_LIMIT_EXCEEDED', 'BELOW_FLOOR_PRICE'.
+    Rows are never deleted; the owner resolves them (status OPEN -> RESOLVED).
+    """
+    __tablename__ = "stock_alerts"
+
+    alert_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="OPEN", nullable=False, index=True)
+    reference_doc_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    reference_doc_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    reference_doc_number: Mapped[str] = mapped_column(String(60), nullable=False)
+    product_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("products.id"), nullable=True)
+    party_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("parties.id"), nullable=True)
+    godown_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("godowns.id"), nullable=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    is_offline_created: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    owner_override: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolution_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

@@ -3,29 +3,88 @@
 import uuid
 from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
+from sqlalchemy.schema import CreateColumn
 
 from app.core.database import Base, engine, async_session_factory
+from app.core.rls_policies import TENANT_SETTING, all_rls_statements, tenant_scoped_tables
+from app.core.security import hash_pin
 from app.models.tenant import Tenant, Device, NumberSeries
 from app.models.catalogue import Category, Brand, Product, ProductUnit, PriceList, ProductPrice
 from app.models.stock import Godown, StockBalance
 from app.models.ledger import Party
 
 DEMO_TENANT_ID = "00000000-0000-0000-0000-000000000001"
+# Demo-only owner PIN. The owner MUST change it (POST /api/v1/auth/change-pin) before real use.
+DEMO_OWNER_PIN = "1234"
+
+
+def _add_missing_sqlite_columns(sync_conn) -> None:
+    """Local/offline SQLite databases created by an older build: add new nullable/defaulted columns.
+
+    (PostgreSQL deployments are migrated with Alembic instead.)
+    """
+    inspector = inspect(sync_conn)
+    existing_tables = set(inspector.get_table_names())
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+        present = {c["name"] for c in inspector.get_columns(table.name)}
+        for col in table.columns:
+            if col.name in present:
+                continue
+            if col.primary_key or (not col.nullable and col.server_default is None):
+                continue  # cannot add NOT NULL without a default; needs a real migration
+            col_def = CreateColumn(col).compile(dialect=sync_conn.dialect)
+            ddl = f'ALTER TABLE "{table.name}" ADD COLUMN {col_def}'
+            sync_conn.execute(text(ddl))
+
+    # purchase_bills: supplier invoice numbers became unique per (tenant, supplier). SQLite cannot
+    # ALTER a constraint, so rebuild the table (alembic batch mode copies the rows across).
+    if "purchase_bills" in existing_tables:
+        ddl = sync_conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'purchase_bills'")
+        ).scalar() or ""
+        if "uq_purchase_bill_invoice_number" in ddl:
+            from alembic.migration import MigrationContext
+            from alembic.operations import Operations
+
+            ops = Operations(MigrationContext.configure(sync_conn))
+            with ops.batch_alter_table("purchase_bills", recreate="always") as batch:
+                batch.drop_constraint("uq_purchase_bill_invoice_number", type_="unique")
+                batch.create_unique_constraint(
+                    "uq_purchase_bill_supplier_invoice", ["tenant_id", "supplier_id", "supplier_invoice_number"]
+                )
 
 
 async def init_db() -> None:
-    """Create all tables in the active database engine."""
+    """Create all tables in the active database engine (and RLS policies on PostgreSQL)."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if conn.dialect.name == "sqlite":
+            await conn.run_sync(_add_missing_sqlite_columns)
+        elif conn.dialect.name == "postgresql":
+            for stmt in all_rls_statements(tenant_scoped_tables(Base.metadata)):
+                await conn.execute(text(stmt))
 
 
 async def seed_demo_data() -> None:
     """Seed initial tenant, price lists, godowns, and sample hardware catalogue."""
     async with async_session_factory() as session:
+        if session.bind.dialect.name == "postgresql":
+            # FORCE RLS applies to the seeding connection too
+            await session.execute(
+                text("SELECT set_config(:s, :t, true)"), {"s": TENANT_SETTING, "t": DEMO_TENANT_ID}
+            )
+
         # Check if demo tenant already exists
         result = await session.execute(select(Tenant).where(Tenant.id == DEMO_TENANT_ID))
-        if result.scalar_one_or_none() is not None:
+        existing_tenant = result.scalar_one_or_none()
+        if existing_tenant is not None:
+            if not existing_tenant.owner_pin_hash:
+                # Databases seeded before the owner PIN existed get the demo PIN
+                existing_tenant.owner_pin_hash = hash_pin(DEMO_OWNER_PIN)
+                await session.commit()
             return  # Already seeded
 
         # 1. Tenant
@@ -40,6 +99,7 @@ async def seed_demo_data() -> None:
             city="Salem",
             state_code="33",
             pincode="636004",
+            owner_pin_hash=hash_pin(DEMO_OWNER_PIN),
         )
         session.add(tenant)
 

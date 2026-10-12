@@ -13,6 +13,8 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Optional, Tuple
 
+from app.core.timeutils import today_ist
+
 TWO_PLACES = Decimal("0.01")
 
 
@@ -25,7 +27,7 @@ class LedgerEntry:
     debit_amount: Decimal = Decimal("0.00")
     credit_amount: Decimal = Decimal("0.00")
     reference_doc_number: str = ""
-    entry_date: date = field(default_factory=date.today)
+    entry_date: date = field(default_factory=today_ist)
 
 
 @dataclass
@@ -195,7 +197,7 @@ class PartyLedgerEngine:
     def calculate_ageing(self, as_of_date: Optional[date] = None) -> AgeingBucket:
         """Classify outstanding invoices into ageing buckets."""
         if as_of_date is None:
-            as_of_date = date.today()
+            as_of_date = today_ist()
 
         bucket = AgeingBucket()
         for entry, outstanding in self.get_open_invoices():

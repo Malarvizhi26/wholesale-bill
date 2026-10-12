@@ -2,7 +2,10 @@
 
 from decimal import Decimal
 from typing import List, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# GST slabs allowed on the product master
+ALLOWED_GST_RATES = {Decimal("0"), Decimal("5"), Decimal("12"), Decimal("18"), Decimal("28")}
 
 
 class ProductUnitSchema(BaseModel):
@@ -35,8 +38,16 @@ class ProductCreateSchema(BaseModel):
     min_stock_base: Decimal = Decimal("0.0000")
     reorder_quantity_base: Decimal = Decimal("0.0000")
     purchase_price_base: Decimal = Decimal("0.0000")
+    gst_rate_percent: Decimal = Decimal("18.00")
     units: List[ProductUnitSchema] = []
     prices: List[ProductPriceSchema] = []
+
+    @field_validator("gst_rate_percent")
+    @classmethod
+    def _valid_gst_slab(cls, v: Decimal) -> Decimal:
+        if v not in ALLOWED_GST_RATES:
+            raise ValueError("gst_rate_percent must be one of 0, 5, 12, 18, 28")
+        return v.quantize(Decimal("0.01"))
 
 
 class ProductResponseSchema(BaseModel):
@@ -52,7 +63,20 @@ class ProductResponseSchema(BaseModel):
     min_stock_base: Decimal
     reorder_quantity_base: Decimal
     purchase_price_base: Decimal
+    gst_rate_percent: Decimal = Decimal("18.00")
     is_active: bool
     units: List[ProductUnitSchema] = []
+    # Stock in base units summed across godowns (or the requested godown) + packaging breakdown
+    current_stock_base: Decimal = Decimal("0.0000")
+    display_stock: str = ""
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PriceListResponseSchema(BaseModel):
+    id: str
+    code: str
+    name: str
+    is_default: bool = False
 
     model_config = ConfigDict(from_attributes=True)

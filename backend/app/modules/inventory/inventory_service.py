@@ -18,6 +18,7 @@ from app.models.stock import (
     StockAdjustment,
     StockAdjustmentLine,
 )
+from app.core.timeutils import ist_date_of, now_ist, to_utc
 from app.models.ledger import Party, LedgerEntry
 from app.modules.inventory.unit_converter import SmartUnitConverter, UnitDefinition
 from app.schemas.inventory import (
@@ -78,8 +79,27 @@ class InventoryService:
                 select(Party).where(Party.id == payload.supplier_id, Party.tenant_id == tenant_id)
             )
 
+        # Supplier invoice numbers are unique per supplier (two suppliers may both issue "INV-101").
+        # Without a supplier master record the supplier is identified by name.
+        dup_stmt = select(PurchaseBill.id).where(
+            PurchaseBill.tenant_id == tenant_id,
+            PurchaseBill.supplier_invoice_number == payload.supplier_invoice_number,
+        )
+        if payload.supplier_id:
+            dup_stmt = dup_stmt.where(PurchaseBill.supplier_id == payload.supplier_id)
+        else:
+            dup_stmt = dup_stmt.where(
+                PurchaseBill.supplier_id.is_(None),
+                func.lower(PurchaseBill.supplier_name) == payload.supplier_name.strip().lower(),
+            )
+        duplicate = await session.scalar(dup_stmt)
+        if duplicate:
+            raise ValueError(
+                f"Purchase bill {payload.supplier_invoice_number} from {payload.supplier_name} is already recorded"
+            )
+
         bill_id = str(uuid.uuid4())
-        bill_date = payload.bill_date or datetime.now(timezone.utc)
+        bill_date = to_utc(payload.bill_date) or datetime.now(timezone.utc)
 
         # 3. Calculate Line-level Subtotals
         calculated_lines = []
@@ -95,7 +115,10 @@ class InventoryService:
             if not product:
                 raise ValueError(f"Product {line_in.product_id} not found")
 
-            base_qty = (line_in.quantity * line_in.conversion_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
+            conv_factor = SmartUnitConverter.resolve_conversion_factor(
+                product.units, line_in.unit_name, line_in.conversion_factor
+            )
+            base_qty = (line_in.quantity * conv_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
             gross_amount = (line_in.quantity * line_in.unit_purchase_price).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
             disc = min(line_in.discount_amount, gross_amount).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
             taxable = (gross_amount - disc).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
@@ -110,7 +133,7 @@ class InventoryService:
                 "product": product,
                 "product_id": line_in.product_id,
                 "unit_name": line_in.unit_name,
-                "conversion_factor": line_in.conversion_factor,
+                "conversion_factor": conv_factor,
                 "quantity": line_in.quantity,
                 "base_quantity": base_qty,
                 "unit_purchase_price": line_in.unit_purchase_price,
@@ -127,8 +150,12 @@ class InventoryService:
         )
 
         db_lines: List[PurchaseBillLine] = []
-        for line_data in calculated_lines:
-            if total_taxable > Decimal("0.00"):
+        overhead_assigned = Decimal("0.00")
+        for line_pos, line_data in enumerate(calculated_lines):
+            if line_pos == len(calculated_lines) - 1:
+                # Last line absorbs the rounding remainder so apportioned paise sum exactly to the overhead
+                line_overhead = total_overhead - overhead_assigned
+            elif total_taxable > Decimal("0.00"):
                 line_overhead = (total_overhead * (line_data["taxable_amount"] / total_taxable)).quantize(
                     TWO_PLACES, rounding=ROUND_HALF_UP
                 )
@@ -136,6 +163,7 @@ class InventoryService:
                 line_overhead = (total_overhead / Decimal(len(calculated_lines))).quantize(
                     TWO_PLACES, rounding=ROUND_HALF_UP
                 )
+            overhead_assigned += line_overhead
 
             # Landed cost per base unit = (taxable_amount + apportioned_overhead) / base_quantity
             total_landed_line = line_data["taxable_amount"] + line_overhead
@@ -237,6 +265,7 @@ class InventoryService:
                     last_movement_at=datetime.now(timezone.utc),
                 )
                 session.add(stock_balance)
+                await session.flush()  # make the new balance visible to later lines (autoflush is off)
 
             # Update Product latest purchase price base
             prod = await session.scalar(select(Product).where(Product.id == line_row.product_id))
@@ -255,7 +284,7 @@ class InventoryService:
                 reference_doc_type="PURCHASE_BILL",
                 reference_doc_id=bill_id,
                 reference_doc_number=payload.supplier_invoice_number,
-                entry_date=bill_date.date(),
+                entry_date=ist_date_of(bill_date),
                 notes=f"Purchase bill #{payload.supplier_invoice_number} from {payload.supplier_name}",
             )
             session.add(ledger_entry)
@@ -284,20 +313,25 @@ class InventoryService:
 
         adj_id = str(uuid.uuid4())
         adj_date = datetime.now(timezone.utc)
-        adj_number = f"ADJ-{adj_date.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+        adj_number = f"ADJ-{now_ist().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
 
         db_lines: List[StockAdjustmentLine] = []
         total_discrepancy_val = Decimal("0.00")
 
         for idx, line_in in enumerate(payload.lines, start=1):
             product = await session.scalar(
-                select(Product).where(Product.id == line_in.product_id, Product.tenant_id == tenant_id)
+                select(Product)
+                .where(Product.id == line_in.product_id, Product.tenant_id == tenant_id)
+                .options(selectinload(Product.units))
             )
             if not product:
                 raise ValueError(f"Product {line_in.product_id} not found")
 
-            # Base quantity difference: quantity * conversion_factor
-            base_qty = (line_in.quantity * line_in.conversion_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
+            # Base quantity difference: quantity * catalogue conversion_factor
+            conv_factor = SmartUnitConverter.resolve_conversion_factor(
+                product.units, line_in.unit_name, line_in.conversion_factor
+            )
+            base_qty = (line_in.quantity * conv_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
 
             # Current unit cost base from godown balance or product purchase price
             balance = await session.scalar(
@@ -318,7 +352,7 @@ class InventoryService:
                 line_number=idx,
                 product_id=line_in.product_id,
                 unit_name=line_in.unit_name,
-                conversion_factor=line_in.conversion_factor,
+                conversion_factor=conv_factor,
                 quantity=line_in.quantity,
                 base_quantity=base_qty,
                 unit_cost_base=unit_cost,
@@ -357,6 +391,7 @@ class InventoryService:
                     last_movement_at=datetime.now(timezone.utc),
                 )
                 session.add(balance)
+                await session.flush()  # make the new balance visible to later lines (autoflush is off)
 
         stock_adj = StockAdjustment(
             id=adj_id,
@@ -400,13 +435,18 @@ class InventoryService:
             raise ValueError("Target godown not found")
 
         product = await session.scalar(
-            select(Product).where(Product.id == payload.product_id, Product.tenant_id == tenant_id)
+            select(Product)
+            .where(Product.id == payload.product_id, Product.tenant_id == tenant_id)
+            .options(selectinload(Product.units))
         )
         if not product:
             raise ValueError("Product not found")
 
-        base_qty = (payload.quantity * payload.conversion_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
-        transfer_ref = f"TRF-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+        conv_factor = SmartUnitConverter.resolve_conversion_factor(
+            product.units, payload.unit_name, payload.conversion_factor
+        )
+        base_qty = (payload.quantity * conv_factor).quantize(FOUR_PLACES, rounding=ROUND_HALF_UP)
+        transfer_ref = f"TRF-{now_ist().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
 
         # Get Source WAC
         src_balance = await session.scalar(
@@ -451,6 +491,7 @@ class InventoryService:
                 last_movement_at=datetime.now(timezone.utc),
             )
             session.add(src_balance)
+            await session.flush()  # make the new balance visible to later lines (autoflush is off)
 
         # 2. Target Godown: TRANSFER_IN
         tgt_movement = StockMovement(
@@ -495,6 +536,7 @@ class InventoryService:
                 last_movement_at=datetime.now(timezone.utc),
             )
             session.add(tgt_balance)
+            await session.flush()  # make the new balance visible to later lines (autoflush is off)
 
         await session.commit()
 

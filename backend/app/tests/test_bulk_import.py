@@ -8,7 +8,7 @@ from app.core.database import async_session_factory
 from app.core.init_db import init_db, seed_demo_data, DEMO_TENANT_ID
 from app.modules.inventory.excel_import import CatalogueImportEngine
 from app.models.catalogue import Product, ProductUnit
-from app.models.stock import StockBalance
+from app.models.stock import Godown, StockBalance
 
 SAMPLE_CSV = """code,name,tamil_name,category,brand,hsn_code,base_unit,purchase_price,selling_price_retail,selling_price_contractor,packing_unit,packing_factor,opening_stock_base,is_variable_weight
 ROD016,16mm TMT Rod Fe500,16மிமீ கம்பி,TMT Steel,Jindal,7214,kg,56.00,64.00,61.50,Rod,18.96,1896.00,Y
@@ -67,6 +67,10 @@ async def test_commit_catalogue_creates_db_records():
     assert len(errors) == 0
 
     async with async_session_factory() as session:
+        # Opening stock needs a real godown for the tenant (no phantom godown ids)
+        session.add(Godown(id=str(uuid.uuid4()), tenant_id=test_tenant_id, code="MAIN", name="Main", is_primary=True))
+        await session.commit()
+
         result = await CatalogueImportEngine.commit_catalogue(
             tenant_id=test_tenant_id,
             rows=rows,
